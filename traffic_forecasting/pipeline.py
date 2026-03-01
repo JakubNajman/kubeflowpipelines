@@ -89,7 +89,7 @@ def fetch_hourly_aggregated(
         }
     }
 
-    resp    = es.search(index=",".join(indices), body=query, size=0)
+    resp    = es.search(index=",".join(indices), body=query)
     buckets = resp["aggregations"]["per_hour"]["buckets"]
 
     if not buckets:
