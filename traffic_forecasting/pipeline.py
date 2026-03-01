@@ -1,7 +1,6 @@
 import kfp
 from kfp import dsl
 from kfp.dsl import component, pipeline, Input, Output, Dataset, Model, Metrics
-import kfp_kubernetes
 
 @component(
     base_image="python:3.9",
@@ -460,7 +459,6 @@ def traffic_forecasting_pipeline(
     fetch_task.set_memory_request("256Mi")
     fetch_task.set_cpu_limit("0.5")
     fetch_task.set_cpu_request("0.25")
-    fetch_task.kfp_kubernetes.set_timeout(300)   # 5 min max — it's just 216 rows
 
     preprocess_task = preprocess_and_save_history(
         input_data=fetch_task.outputs["output_data"],
@@ -472,7 +470,6 @@ def traffic_forecasting_pipeline(
     )
     preprocess_task.set_memory_limit("512Mi")
     preprocess_task.set_cpu_limit("0.5")
-    preprocess_task.kfp_kubernetes.set_timeout(120)
 
     train_task = train_model(
         input_data=preprocess_task.outputs["output_data"],
@@ -480,7 +477,6 @@ def traffic_forecasting_pipeline(
     )
     train_task.set_memory_limit("2G")
     train_task.set_cpu_limit("2")
-    train_task.kfp_kubernetes.set_timeout(600)
 
     forecast_task = forecast_and_store_s3(
         input_data=preprocess_task.outputs["output_data"],
@@ -493,7 +489,6 @@ def traffic_forecasting_pipeline(
     )
     forecast_task.set_memory_limit("512Mi")
     forecast_task.set_cpu_limit("0.5")
-    forecast_task.kfp_kubernetes.set_timeout(120)
 
 
 from kfp import compiler
