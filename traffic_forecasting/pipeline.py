@@ -2,12 +2,11 @@ import kfp
 from kfp import dsl
 from kfp.dsl import component, pipeline, Input, Output, Dataset, Model, Metrics
 
-
 @component(
     base_image="python:3.9",
     packages_to_install=["elasticsearch==8.12.0", "pandas"]
 )
-def fetch_last_n_days_from_elasticsearch(
+def fetch_hourly_aggregated(
     es_host:         str,
     es_user:         str,
     es_password:     str,
@@ -16,78 +15,116 @@ def fetch_last_n_days_from_elasticsearch(
     output_data:     Output[Dataset],
 ):
     from elasticsearch import Elasticsearch
-    from elasticsearch.helpers import scan
     import pandas as pd
     from datetime import datetime, timedelta
 
     if not es_host:
-        raise ValueError("es_host is required — fill it in the KFP UI before running")
+        raise ValueError("es_host is required")
     if not es_user:
-        raise ValueError("es_user is required — fill it in the KFP UI before running")
+        raise ValueError("es_user is required")
     if not es_password:
-        raise ValueError("es_password is required — fill it in the KFP UI before running")
+        raise ValueError("es_password is required")
 
     es = Elasticsearch(
         es_host,
         basic_auth=(es_user, es_password),
         verify_certs=False,
+        request_timeout=120,
     )
 
     today = datetime.utcnow().date()
+    since = today - timedelta(days=fetch_days)
 
-    indices_to_fetch = []
+    indices = []
     for offset in range(fetch_days):
         day = today - timedelta(days=offset)
         idx = f"{es_index_prefix}-{day.strftime('%Y.%m.%d')}"
         if es.indices.exists(index=idx):
-            indices_to_fetch.append(idx)
-            print(f"Found: {idx}")
+            indices.append(idx)
+            print(f"{idx}")
         else:
-            print(f"Missing: {idx} — skipping")
+            print(f"{idx} missing — skipping")
 
-    if not indices_to_fetch:
-        raise RuntimeError(
-            f"No indices found for the last {fetch_days} days "
-            f"with prefix '{es_index_prefix}'."
-        )
-
-    print(f"\nFetching {len(indices_to_fetch)} indices: {indices_to_fetch}")
+    if not indices:
+        raise RuntimeError(f"No indices found for the last {fetch_days} days.")
 
     query = {
-        "query": {"match_all": {}},
-        "_source": [
-            "@timestamp",
-            "network.bytes",
-            "network.packets",
-            "flow.id",
-            "network.protocol",
-            "network.direction",
-            "source.bytes",
-            "destination.bytes",
-            "event.duration",
-        ]
+        "size": 0,
+        "query": {
+            "range": {
+                "@timestamp": {
+                    "gte": since.isoformat(),
+                    "lte": today.isoformat(),
+                }
+            }
+        },
+        "aggs": {
+            "per_hour": {
+                "date_histogram": {
+                    "field":          "@timestamp",
+                    "fixed_interval": "1h",
+                    "min_doc_count":  1,
+                },
+                "aggs": {
+                    "total_bytes":   {"sum":         {"field": "network.bytes"}},
+                    "total_packets": {"sum":         {"field": "network.packets"}},
+                    "unique_flows":  {"cardinality": {"field": "flow.id"}},
+                    "avg_duration":  {"avg":         {"field": "event.duration"}},
+                    "src_bytes":     {"sum":         {"field": "source.bytes"}},
+                    "dst_bytes":     {"sum":         {"field": "destination.bytes"}},
+                    "avg_bpp": {
+                        "avg": {
+                            "script": {
+                                "source": (
+                                    "doc['network.bytes'].size() > 0 && "
+                                    "doc['network.packets'].size() > 0 "
+                                    "? doc['network.bytes'].value / (doc['network.packets'].value + 1) "
+                                    ": 0"
+                                )
+                            }
+                        }
+                    },
+                }
+            }
+        }
     }
 
+    resp    = es.search(index=",".join(indices), body=query, size=0)
+    buckets = resp["aggregations"]["per_hour"]["buckets"]
+
+    if not buckets:
+        raise RuntimeError("No aggregation buckets returned — check index field names.")
+
     records = []
-    for idx in indices_to_fetch:
-        day_records = []
-        for hit in scan(es, index=idx, query=query, size=5000):
-            day_records.append(hit["_source"])
-        print(f"  {idx}: {len(day_records):,} records")
-        records.extend(day_records)
+    for b in buckets:
+        records.append({
+            "timestamp":     b["key_as_string"],
+            "total_bytes":   b["total_bytes"]["value"]   or 0,
+            "total_packets": b["total_packets"]["value"] or 0,
+            "unique_flows":  b["unique_flows"]["value"]  or 0,
+            "avg_duration":  b["avg_duration"]["value"]  or 0,
+            "src_bytes":     b["src_bytes"]["value"]     or 0,
+            "dst_bytes":     b["dst_bytes"]["value"]     or 0,
+            "bytes_per_pkt": b["avg_bpp"]["value"]       or 0,
+        })
 
     df = pd.DataFrame(records)
-    df["_fetched_date"] = str(today)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_localize(None)
+    df = df.sort_values("timestamp").reset_index(drop=True)
     df.to_csv(output_data.path, index=False)
-    print(f"\nTotal fetched: {len(df):,} records across {len(indices_to_fetch)} days")
+
+    print(f"Fetched {len(df)} hourly buckets across {len(indices)} indices")
+    print(f"Range: {df['timestamp'].min()} → {df['timestamp'].max()}")
+    print(df.tail(5).to_string(index=False))
+
 
 @component(
     base_image="python:3.9",
     packages_to_install=["pandas", "numpy", "boto3"]
 )
-def preprocess_and_merge(
-    input_data:    Input[Dataset],
-    output_data:   Output[Dataset],
+def preprocess_and_save_history(
+    input_data:  Input[Dataset],
+    output_data: Output[Dataset],
     s3_endpoint:   str,
     s3_access_key: str,
     s3_secret_key: str,
@@ -96,16 +133,15 @@ def preprocess_and_merge(
 ):
     import pandas as pd
     import numpy as np
-    import boto3
+    import boto3, io
     from botocore.client import Config
-    import io
 
     if not s3_endpoint:
-        raise ValueError("s3_endpoint is required — fill it in the KFP UI before running")
+        raise ValueError("s3_endpoint is required")
     if not s3_access_key:
-        raise ValueError("s3_access_key is required — fill it in the KFP UI before running")
+        raise ValueError("s3_access_key is required")
     if not s3_secret_key:
-        raise ValueError("s3_secret_key is required — fill it in the KFP UI before running")
+        raise ValueError("s3_secret_key is required")
 
     s3 = boto3.client(
         "s3",
@@ -117,52 +153,37 @@ def preprocess_and_merge(
     )
 
     df = pd.read_csv(input_data.path)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
 
-    df["@timestamp"] = pd.to_datetime(
-        df["@timestamp"],
-        format="%b %d, %Y @ %H:%M:%S.%f",
-        errors="coerce"
-    )
-    mask = df["@timestamp"].isna()
-    if mask.any():
-        df.loc[mask, "@timestamp"] = pd.to_datetime(
-            df.loc[mask, "@timestamp"], utc=True, errors="coerce"
-        ).dt.tz_localize(None)
+    print(f"Hourly rows: {len(df)}")
+    print(f"Range: {df['timestamp'].min()} → {df['timestamp'].max()}")
 
-    df = df.dropna(subset=["@timestamp"])
-    if df["@timestamp"].dt.tz is not None:
-        df["@timestamp"] = df["@timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
+    df["bytes_lag_1h"]   = df["total_bytes"].shift(1).fillna(df["total_bytes"])
+    df["bytes_lag_2h"]   = df["total_bytes"].shift(2).fillna(df["total_bytes"])
+    df["bytes_lag_3h"]   = df["total_bytes"].shift(3).fillna(df["total_bytes"])
+    df["bytes_lag_6h"]   = df["total_bytes"].shift(6).fillna(df["total_bytes"])
+    df["bytes_lag_12h"]  = df["total_bytes"].shift(12).fillna(df["total_bytes"])
+    df["bytes_lag_24h"]  = df["total_bytes"].shift(24).fillna(df["total_bytes"])  # same hour yesterday
+    df["bytes_lag_168h"] = df["total_bytes"].shift(168).fillna(df["total_bytes"]) # same hour last week
 
-    for col in ["network.bytes", "network.packets", "source.bytes",
-                "destination.bytes", "event.duration"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    df["bytes_rolling_3h"]  = df["total_bytes"].rolling(3,   min_periods=1).mean()
+    df["bytes_rolling_6h"]  = df["total_bytes"].rolling(6,   min_periods=1).mean()
+    df["bytes_rolling_12h"] = df["total_bytes"].rolling(12,  min_periods=1).mean()
+    df["bytes_rolling_24h"] = df["total_bytes"].rolling(24,  min_periods=1).mean()
+    df["bytes_rolling_7d"]  = df["total_bytes"].rolling(168, min_periods=1).mean()
 
-    df["bytes_per_packet"] = df["network.bytes"] / (df["network.packets"] + 1)
-
-    daily_df = (
-        df.set_index("@timestamp")
-        .resample("1D")
-        .agg(
-            total_bytes  =("network.bytes",     "sum"),
-            total_packets=("network.packets",   "sum"),
-            unique_flows =("flow.id",           "nunique"),
-            avg_duration =("event.duration",    "mean"),
-            src_bytes    =("source.bytes",      "sum"),
-            dst_bytes    =("destination.bytes", "sum"),
-            bytes_per_pkt=("bytes_per_packet",  "mean"),
-        )
-        .reset_index()
-        .rename(columns={"@timestamp": "date"})
-    )
-
-    daily_df = daily_df[daily_df["total_bytes"] > 0].reset_index(drop=True)
-
-    print(f"Aggregated into {len(daily_df)} daily rows:")
-    print(daily_df[["date", "total_bytes", "total_packets", "unique_flows"]].to_string(index=False))
+    df["hour_of_day"]   = df["timestamp"].dt.hour
+    df["day_of_week"]   = df["timestamp"].dt.dayofweek
+    df["is_weekend"]    = (df["day_of_week"] >= 5).astype(int)
+    df["hour_sin"]      = np.sin(2 * np.pi * df["hour_of_day"] / 24)
+    df["hour_cos"]      = np.cos(2 * np.pi * df["hour_of_day"] / 24)
+    df["dow_sin"]       = np.sin(2 * np.pi * df["day_of_week"] / 7)
+    df["dow_cos"]       = np.cos(2 * np.pi * df["day_of_week"] / 7)
 
     try:
         buf = io.StringIO()
-        daily_df.to_csv(buf, index=False)
+        df.to_csv(buf, index=False)
         s3.put_object(
             Bucket=s3_bucket,
             Key=history_key,
@@ -173,15 +194,8 @@ def preprocess_and_merge(
     except Exception as e:
         print(f"Warning: could not save history to S3: {e}")
 
-    daily_df["bytes_lag_1"]      = daily_df["total_bytes"].shift(1).fillna(daily_df["total_bytes"])
-    daily_df["bytes_lag_2"]      = daily_df["total_bytes"].shift(2).fillna(daily_df["total_bytes"])
-    daily_df["bytes_lag_3"]      = daily_df["total_bytes"].shift(3).fillna(daily_df["total_bytes"])
-    daily_df["bytes_lag_7"]      = daily_df["total_bytes"].shift(7).fillna(daily_df["total_bytes"])
-    daily_df["bytes_rolling_7d"] = daily_df["total_bytes"].expanding(min_periods=1).mean()
-    daily_df["bytes_rolling_3d"] = daily_df["total_bytes"].rolling(3, min_periods=1).mean()
-
-    daily_df.to_csv(output_data.path, index=False)
-    print(f"Training-ready rows: {len(daily_df)}")
+    df.to_csv(output_data.path, index=False)
+    print(f"Training-ready rows: {len(df)}")
 
 
 @component(
@@ -192,7 +206,7 @@ def train_model(
     input_data:       Input[Dataset],
     model_output:     Output[Model],
     metrics:          Output[Metrics],
-    forecast_horizon: int,
+    forecast_horizon: int,   # in hours
 ):
     import pandas as pd
     import numpy as np
@@ -202,36 +216,42 @@ def train_model(
     import joblib, os
 
     df = pd.read_csv(input_data.path)
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date")
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp")
 
-    n_days = len(df)
-    print(f"Training on {n_days} day(s) of history")
+    n_hours = len(df)
+    print(f"Training on {n_hours} hourly rows ({n_hours/24:.1f} days)")
 
     feature_cols = [
+        # Raw features
         "total_packets", "unique_flows", "avg_duration",
         "src_bytes", "dst_bytes", "bytes_per_pkt",
-        "bytes_lag_1", "bytes_lag_2", "bytes_lag_3", "bytes_lag_7",
-        "bytes_rolling_7d", "bytes_rolling_3d",
+        # Lag features
+        "bytes_lag_1h", "bytes_lag_2h", "bytes_lag_3h",
+        "bytes_lag_6h", "bytes_lag_12h", "bytes_lag_24h", "bytes_lag_168h",
+        # Rolling features
+        "bytes_rolling_3h", "bytes_rolling_6h",
+        "bytes_rolling_12h", "bytes_rolling_24h", "bytes_rolling_7d",
+        # Time features
+        "hour_sin", "hour_cos", "dow_sin", "dow_cos", "is_weekend",
     ]
     target_col = "total_bytes"
 
     X = df[feature_cols].fillna(0)
     y = df[target_col]
 
-    if n_days < 21:
-        print(f"Using Ridge regression ({n_days} days — below 21-day XGBoost threshold)")
-        if n_days > forecast_horizon:
-            split = n_days - forecast_horizon
-            X_train, X_test = X.iloc[:split], X.iloc[split:]
-            y_train, y_test = y.iloc[:split], y.iloc[split:]
+    if n_hours < 168: 
+        print(f"Using Ridge regression ({n_hours} hours — below 168h XGBoost threshold)")
+        if n_hours > forecast_horizon:
+            split = n_hours - forecast_horizon
             model = Ridge(alpha=1.0)
-            model.fit(X_train, y_train)
-            preds = model.predict(X_test)
+            model.fit(X.iloc[:split], y.iloc[:split])
+            preds = model.predict(X.iloc[split:])
+            y_test = y.iloc[split:]
             mae   = mean_absolute_error(y_test, preds)
             rmse  = np.sqrt(mean_squared_error(y_test, preds))
             mape  = np.mean(np.abs((y_test.values - preds) / (y_test.values + 1))) * 100
-            model.fit(X, y)
+            model.fit(X, y)  # refit on all data
         else:
             model = Ridge(alpha=1.0)
             model.fit(X, y)
@@ -240,16 +260,24 @@ def train_model(
             rmse  = np.sqrt(mean_squared_error(y, preds))
             mape  = np.mean(np.abs((y.values - preds) / (y.values + 1))) * 100
     else:
-        print("Using XGBoost")
-        split = n_days - forecast_horizon
+        print(f"Using XGBoost ({n_hours} hours)")
+        split = n_hours - forecast_horizon
         X_train, X_test = X.iloc[:split], X.iloc[split:]
         y_train, y_test = y.iloc[:split], y.iloc[split:]
         model = xgb.XGBRegressor(
-            n_estimators=200, learning_rate=0.05,
-            max_depth=4, subsample=0.8,
-            random_state=42, verbosity=0,
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=5,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            verbosity=0,
         )
-        model.fit(X_train, y_train)
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_test, y_test)],
+            verbose=False,
+        )
         preds = model.predict(X_test)
         mae   = mean_absolute_error(y_test, preds)
         rmse  = np.sqrt(mean_squared_error(y_test, preds))
@@ -259,14 +287,19 @@ def train_model(
     print(f"RMSE: {rmse:,.0f} bytes")
     print(f"MAPE: {mape:.2f}%")
 
-    metrics.log_metric("MAE",           float(mae))
-    metrics.log_metric("RMSE",          float(rmse))
-    metrics.log_metric("MAPE",          float(mape))
-    metrics.log_metric("training_days", float(n_days))
+    metrics.log_metric("MAE",            float(mae))
+    metrics.log_metric("RMSE",           float(rmse))
+    metrics.log_metric("MAPE",           float(mape))
+    metrics.log_metric("training_hours", float(n_hours))
 
     os.makedirs(model_output.path, exist_ok=True)
     joblib.dump(model, os.path.join(model_output.path, "model.joblib"))
-    print("Model saved ✓")
+
+    import json
+    with open(os.path.join(model_output.path, "features.json"), "w") as f:
+        json.dump(feature_cols, f)
+
+    print("Model + features saved ✓")
 
 
 @component(
@@ -280,7 +313,7 @@ def forecast_and_store_s3(
     s3_access_key:    str,
     s3_secret_key:    str,
     s3_bucket:        str,
-    forecast_horizon: int,
+    forecast_horizon: int,   # in hours
 ):
     import pandas as pd
     import numpy as np
@@ -291,57 +324,73 @@ def forecast_and_store_s3(
     import io
 
     if not s3_endpoint:
-        raise ValueError("s3_endpoint is required — fill it in the KFP UI before running")
+        raise ValueError("s3_endpoint is required")
     if not s3_access_key:
-        raise ValueError("s3_access_key is required — fill it in the KFP UI before running")
+        raise ValueError("s3_access_key is required")
     if not s3_secret_key:
-        raise ValueError("s3_secret_key is required — fill it in the KFP UI before running")
+        raise ValueError("s3_secret_key is required")
 
     df = pd.read_csv(input_data.path)
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date")
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp")
 
     model = joblib.load(os.path.join(model_input.path, "model.joblib"))
+    with open(os.path.join(model_input.path, "features.json")) as f:
+        feature_cols = json.load(f)
 
-    feature_cols = [
-        "total_packets", "unique_flows", "avg_duration",
-        "src_bytes", "dst_bytes", "bytes_per_pkt",
-        "bytes_lag_1", "bytes_lag_2", "bytes_lag_3", "bytes_lag_7",
-        "bytes_rolling_7d", "bytes_rolling_3d",
-    ]
-
-    last_row  = df.iloc[-1].copy()
+    last_row = df.iloc[-1].copy()
+    history  = df["total_bytes"].tolist()
     forecasts = []
-    history   = df["total_bytes"].tolist()
 
     for i in range(1, forecast_horizon + 1):
-        future_date = last_row["date"] + timedelta(days=i)
+        future_ts  = last_row["timestamp"] + timedelta(hours=i)
+        hour_of_day = future_ts.hour
+        day_of_week = future_ts.dayofweek
+
         row = {
+            # Raw features — carry forward last known values
             "total_packets":    last_row["total_packets"],
             "unique_flows":     last_row["unique_flows"],
             "avg_duration":     last_row["avg_duration"],
             "src_bytes":        last_row["src_bytes"],
             "dst_bytes":        last_row["dst_bytes"],
             "bytes_per_pkt":    last_row["bytes_per_pkt"],
-            "bytes_lag_1":      history[-1],
-            "bytes_lag_2":      history[-2] if len(history) >= 2 else history[-1],
-            "bytes_lag_3":      history[-3] if len(history) >= 3 else history[-1],
-            "bytes_lag_7":      history[-7] if len(history) >= 7 else history[-1],
-            "bytes_rolling_7d": np.mean(history[-7:]),
-            "bytes_rolling_3d": np.mean(history[-3:]),
+            # Lag features from rolling history
+            "bytes_lag_1h":     history[-1],
+            "bytes_lag_2h":     history[-2]   if len(history) >= 2   else history[-1],
+            "bytes_lag_3h":     history[-3]   if len(history) >= 3   else history[-1],
+            "bytes_lag_6h":     history[-6]   if len(history) >= 6   else history[-1],
+            "bytes_lag_12h":    history[-12]  if len(history) >= 12  else history[-1],
+            "bytes_lag_24h":    history[-24]  if len(history) >= 24  else history[-1],
+            "bytes_lag_168h":   history[-168] if len(history) >= 168 else history[-1],
+            # Rolling features
+            "bytes_rolling_3h":  np.mean(history[-3:]),
+            "bytes_rolling_6h":  np.mean(history[-6:]),
+            "bytes_rolling_12h": np.mean(history[-12:]),
+            "bytes_rolling_24h": np.mean(history[-24:]),
+            "bytes_rolling_7d":  np.mean(history[-168:]),
+            # Time features
+            "hour_sin":   np.sin(2 * np.pi * hour_of_day / 24),
+            "hour_cos":   np.cos(2 * np.pi * hour_of_day / 24),
+            "dow_sin":    np.sin(2 * np.pi * day_of_week / 7),
+            "dow_cos":    np.cos(2 * np.pi * day_of_week / 7),
+            "is_weekend": int(day_of_week >= 5),
         }
+
         pred = float(model.predict(pd.DataFrame([row]))[0])
+        pred = max(0, pred)  # bytes can't be negative
+
         forecasts.append({
-            "date":           future_date.isoformat(),
+            "timestamp":      future_ts.isoformat(),
             "forecast_bytes": pred,
             "generated_at":   datetime.utcnow().isoformat(),
-            "training_days":  len(df),
-            "horizon_days":   forecast_horizon,
+            "training_hours": len(df),
+            "horizon_hours":  forecast_horizon,
         })
         history.append(pred)
 
     forecast_df = pd.DataFrame(forecasts)
-    print(forecast_df.to_string(index=False))
+    print(forecast_df[["timestamp", "forecast_bytes"]].to_string(index=False))
 
     s3 = boto3.client(
         "s3",
@@ -357,15 +406,15 @@ def forecast_and_store_s3(
         s3.create_bucket(Bucket=s3_bucket)
         print(f"Created bucket: {s3_bucket}")
 
-    run_date   = datetime.utcnow().strftime("%Y-%m-%d")
+    run_ts     = datetime.utcnow().strftime("%Y-%m-%dT%H-%M")
     csv_buf    = io.StringIO()
     forecast_df.to_csv(csv_buf, index=False)
     csv_bytes  = csv_buf.getvalue().encode("utf-8")
     json_bytes = json.dumps(forecasts, indent=2).encode("utf-8")
 
-    s3.put_object(Bucket=s3_bucket, Key=f"forecasts/{run_date}/forecast.csv",
+    s3.put_object(Bucket=s3_bucket, Key=f"forecasts/{run_ts}/forecast.csv",
                   Body=csv_bytes, ContentType="text/csv")
-    s3.put_object(Bucket=s3_bucket, Key=f"forecasts/{run_date}/forecast.json",
+    s3.put_object(Bucket=s3_bucket, Key=f"forecasts/{run_ts}/forecast.json",
                   Body=json_bytes, ContentType="application/json")
     s3.put_object(Bucket=s3_bucket, Key="forecasts/latest/forecast.csv",
                   Body=csv_bytes, ContentType="text/csv")
@@ -375,39 +424,44 @@ def forecast_and_store_s3(
     model_buf = io.BytesIO()
     joblib.dump(model, model_buf)
     model_buf.seek(0)
-    s3.put_object(Bucket=s3_bucket, Key=f"models/{run_date}/model.joblib",
+    s3.put_object(Bucket=s3_bucket, Key=f"models/{run_ts}/model.joblib",
                   Body=model_buf.read(), ContentType="application/octet-stream")
-    print(f"Saved → s3://{s3_bucket}/forecasts/{run_date}/ and models/{run_date}/")
+
+    print(f"Saved → s3://{s3_bucket}/forecasts/{run_ts}/")
     print("Updated forecasts/latest/ ✓")
 
 
-
 @pipeline(
-    name="packetbeat-traffic-forecasting",
-    description="Daily: fetch last N days from ES → aggregate → train → forecast → store S3",
+    name="packetbeat-traffic-forecasting-hourly",
+    description="Hourly ES aggregation → feature engineering → train → forecast → S3",
 )
 def traffic_forecasting_pipeline(
-    es_host:          str = "",
-    es_user:          str = "",
-    es_password:      str = "",
-    es_index_prefix:  str = "packetbeat-free5gc",
-    fetch_days:       int = 9,
-    forecast_horizon: int = 7,
-    s3_endpoint:      str = "",
-    s3_access_key:    str = "",
-    s3_secret_key:    str = "",
-    s3_bucket:        str = "traffic-forecasts",
-    history_key:      str = "history/daily_aggregated.csv",
+    es_host:          str   = "",
+    es_user:          str   = "",
+    es_password:      str   = "",
+    es_index_prefix:  str   = "packetbeat-free5gc",
+    fetch_days:       int   = 9,
+    forecast_horizon: int   = 168,   # default: forecast next 7 days in hours
+    s3_endpoint:      str   = "",
+    s3_access_key:    str   = "",
+    s3_secret_key:    str   = "",
+    s3_bucket:        str   = "traffic-forecasts",
+    history_key:      str   = "history/hourly_aggregated.csv",
 ):
-    fetch_task = fetch_last_n_days_from_elasticsearch(
+    fetch_task = fetch_hourly_aggregated(
         es_host=es_host,
         es_user=es_user,
         es_password=es_password,
         es_index_prefix=es_index_prefix,
         fetch_days=fetch_days,
     )
+    fetch_task.set_memory_limit("512Mi")
+    fetch_task.set_memory_request("256Mi")
+    fetch_task.set_cpu_limit("0.5")
+    fetch_task.set_cpu_request("0.25")
+    fetch_task.set_active_deadline_seconds(300)   # 5 min max — it's just 216 rows
 
-    preprocess_task = preprocess_and_merge(
+    preprocess_task = preprocess_and_save_history(
         input_data=fetch_task.outputs["output_data"],
         s3_endpoint=s3_endpoint,
         s3_access_key=s3_access_key,
@@ -415,6 +469,9 @@ def traffic_forecasting_pipeline(
         s3_bucket=s3_bucket,
         history_key=history_key,
     )
+    preprocess_task.set_memory_limit("512Mi")
+    preprocess_task.set_cpu_limit("0.5")
+    preprocess_task.set_active_deadline_seconds(120)
 
     train_task = train_model(
         input_data=preprocess_task.outputs["output_data"],
@@ -422,8 +479,9 @@ def traffic_forecasting_pipeline(
     )
     train_task.set_memory_limit("2G")
     train_task.set_cpu_limit("2")
+    train_task.set_active_deadline_seconds(600)
 
-    forecast_and_store_s3(
+    forecast_task = forecast_and_store_s3(
         input_data=preprocess_task.outputs["output_data"],
         model_input=train_task.outputs["model_output"],
         s3_endpoint=s3_endpoint,
@@ -432,12 +490,15 @@ def traffic_forecasting_pipeline(
         s3_bucket=s3_bucket,
         forecast_horizon=forecast_horizon,
     )
+    forecast_task.set_memory_limit("512Mi")
+    forecast_task.set_cpu_limit("0.5")
+    forecast_task.set_active_deadline_seconds(120)
 
 
 from kfp import compiler
 
 compiler.Compiler().compile(
     pipeline_func=traffic_forecasting_pipeline,
-    package_path="traffic_forecasting_pipeline.yaml"
+    package_path="traffic_forecasting_pipeline_hourly.yaml"
 )
-print("Compiled → traffic_forecasting_pipeline.yaml")
+print("Compiled → traffic_forecasting_pipeline_hourly.yaml")
