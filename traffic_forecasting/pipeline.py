@@ -468,14 +468,16 @@ def traffic_forecasting_pipeline(
         s3_bucket=s3_bucket,
         history_key=history_key,
     )
-    preprocess_task.set_memory_limit("512Mi")
-    preprocess_task.set_cpu_limit("0.5")
+    preprocess_task.set_memory_limit("1G")      # up from 512Mi
+    preprocess_task.set_memory_request("512Mi")
+    preprocess_task.set_cpu_limit("1")
 
     train_task = train_model(
         input_data=preprocess_task.outputs["output_data"],
         forecast_horizon=forecast_horizon,
     )
-    train_task.set_memory_limit("2G")
+    train_task.set_memory_limit("4G")           # up from 2G
+    train_task.set_memory_request("2G")
     train_task.set_cpu_limit("2")
 
     forecast_task = forecast_and_store_s3(
@@ -487,8 +489,9 @@ def traffic_forecasting_pipeline(
         s3_bucket=s3_bucket,
         forecast_horizon=forecast_horizon,
     )
-    forecast_task.set_memory_limit("512Mi")
-    forecast_task.set_cpu_limit("0.5")
+    forecast_task.set_memory_limit("1G")        # up from 512Mi
+    forecast_task.set_memory_request("512Mi")
+    forecast_task.set_cpu_limit("1")
 
 
 from kfp import compiler
