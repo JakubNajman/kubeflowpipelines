@@ -68,7 +68,7 @@ def fetch_hourly_aggregated(
                 "aggs": {
                     "total_bytes":   {"sum":         {"field": "network.bytes"}},
                     "total_packets": {"sum":         {"field": "network.packets"}},
-                    "unique_flows":  {"cardinality": {"field": "flow.id"}},
+                    "unique_flows":  {"cardinality": {"field": "flow.id.keyword"}},
                     "avg_duration":  {"avg":         {"field": "event.duration"}},
                     "src_bytes":     {"sum":         {"field": "source.bytes"}},
                     "dst_bytes":     {"sum":         {"field": "destination.bytes"}},
