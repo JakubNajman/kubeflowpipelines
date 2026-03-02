@@ -443,20 +443,16 @@ def forecast_and_store_s3(
 
     if model_type == "xgboost":
         with tempfile.TemporaryDirectory() as tmp:
-            xgb_path = os.path.join(tmp, "model.bst")
+            xgb_path = os.path.join(tmp, "model.json")
             model.save_model(xgb_path)
             with open(xgb_path, "rb") as f:
                 xgb_bytes = f.read()
 
-        s3.put_object(Bucket=s3_bucket, Key=f"models/{run_ts}/model.bst",
-                      Body=xgb_bytes, ContentType="application/octet-stream")
-        s3.put_object(Bucket=s3_bucket, Key="models/latest/model.bst",
-                      Body=xgb_bytes, ContentType="application/octet-stream")
-        print(f"XGBoost native model saved → models/{run_ts}/model.bst + models/latest/model.bst ✓")
-
-    print(f"Saved → s3://{s3_bucket}/forecasts/{run_ts}/")
-    print("Updated forecasts/latest/ ✓")
-
+        s3.put_object(Bucket=s3_bucket, Key=f"models/{run_ts}/model.json",
+                    Body=xgb_bytes, ContentType="application/json")
+        s3.put_object(Bucket=s3_bucket, Key="models/latest/model.json",
+                    Body=xgb_bytes, ContentType="application/json")
+        print(f"XGBoost json model saved → models/{run_ts}/model.json + models/latest/model.json ✓")
 
 @pipeline(
     name="packetbeat-traffic-forecasting-hourly",
