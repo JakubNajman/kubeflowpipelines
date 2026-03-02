@@ -290,6 +290,12 @@ def train_model(
     os.makedirs(model_output.path, exist_ok=True)
     joblib.dump(model, os.path.join(model_output.path, "model.joblib"))
 
+    if model_type == "xgboost":
+        booster = model.get_booster()
+        booster.feature_names = None
+        booster.feature_types = None
+        booster.save_model(os.path.join(model_output.path, "model.json"))
+
     with open(os.path.join(model_output.path, "features.json"), "w") as f:
         json.dump(feature_cols, f)
 
@@ -444,6 +450,9 @@ def forecast_and_store_s3(
     if model_type == "xgboost":
         with tempfile.TemporaryDirectory() as tmp:
             xgb_path = os.path.join(tmp, "model.json")
+            booster = model.get_booster()
+            booster.feature_names = None
+            booster.feature_types = None
             model.save_model(xgb_path)
             with open(xgb_path, "rb") as f:
                 xgb_bytes = f.read()
