@@ -502,6 +502,7 @@ def traffic_forecasting_pipeline(
         es_index_prefix=es_index_prefix,
         fetch_days=fetch_days,
     )
+    fetch_task.set_caching_options(False)
     fetch_task.set_memory_limit("512Mi")
     fetch_task.set_memory_request("256Mi")
     fetch_task.set_cpu_limit("0.5")
