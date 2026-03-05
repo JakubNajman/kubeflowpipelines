@@ -516,6 +516,7 @@ def traffic_forecasting_pipeline(
         s3_bucket=s3_bucket,
         history_key=history_key,
     )
+    preprocess_task.set_caching_options(False)
     preprocess_task.set_memory_limit("1G")      # up from 512Mi
     preprocess_task.set_memory_request("512Mi")
     preprocess_task.set_cpu_limit("1")
@@ -524,6 +525,7 @@ def traffic_forecasting_pipeline(
         input_data=preprocess_task.outputs["output_data"],
         forecast_horizon=forecast_horizon,
     )
+    train_task.set_caching_options(False)
     train_task.set_memory_limit("4G")           # up from 2G
     train_task.set_memory_request("2G")
     train_task.set_cpu_limit("2")
@@ -537,6 +539,7 @@ def traffic_forecasting_pipeline(
         s3_bucket=s3_bucket,
         forecast_horizon=forecast_horizon,
     )
+    forecast_task.set_caching_options(False)
     forecast_task.set_memory_limit("1G")        # up from 512Mi
     forecast_task.set_memory_request("512Mi")
     forecast_task.set_cpu_limit("1")
