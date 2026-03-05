@@ -51,11 +51,26 @@ def fetch_hourly_aggregated(
     query = {
         "size": 0,
         "query": {
-            "range": {
-                "@timestamp": {
-                    "gte": since.isoformat(),
-                    "lte": today.isoformat(),
-                }
+            "bool": {
+                "must": [
+                    {
+                        "range": {
+                            "@timestamp": {
+                                "gte": since.isoformat(),
+                                "lte": today.isoformat(),
+                            }
+                        }
+                    }
+                ],
+                "filter": [
+                    {
+                        "range": {
+                            "event.duration": {
+                                "lte": 3600000000000
+                            }
+                        }
+                    }
+                ]
             }
         },
         "aggs": {
