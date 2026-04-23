@@ -175,6 +175,14 @@ def preprocess_and_save_history(
     print(f"Hourly rows before processing: {len(df)}")
     print(f"Range: {df['timestamp'].min()} → {df['timestamp'].max()}")
 
+    median_bytes = df["total_bytes"].median()
+    outlier_mask = df["total_bytes"] > (median_bytes * 3)
+    n_outliers   = outlier_mask.sum()
+    if n_outliers > 0:
+        print(f"Clipping {n_outliers} outlier hours to median ({median_bytes/1e6:.1f} MB)")
+        print(df[outlier_mask][["timestamp", "total_bytes"]].to_string(index=False))
+        df.loc[outlier_mask, "total_bytes"] = median_bytes
+
     df["bytes_lag_1h"]   = df["total_bytes"].shift(1).fillna(df["total_bytes"])
     df["bytes_lag_2h"]   = df["total_bytes"].shift(2).fillna(df["total_bytes"])
     df["bytes_lag_3h"]   = df["total_bytes"].shift(3).fillna(df["total_bytes"])
