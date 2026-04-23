@@ -2,18 +2,21 @@ import kfp
 from kfp import dsl
 from kfp.dsl import component, pipeline, Input, Output, Dataset, Model, Metrics
 
+
 @component(
     base_image="python:3.9",
     packages_to_install=["elasticsearch==8.12.0", "pandas"]
 )
-def fetch_hourly_aggregated(
+def fetch_traffic_data(
     es_host:         str,
     es_user:         str,
     es_password:     str,
     es_index_prefix: str,
     fetch_days:      int,
+    bucket_interval: str,
     output_data:     Output[Dataset],
 ):
+    """Pull 15-min aggregated traffic from Elasticsearch for anomaly detection training."""
     from elasticsearch import Elasticsearch
     import pandas as pd
     from datetime import datetime, timedelta
@@ -36,14 +39,14 @@ def fetch_hourly_aggregated(
     since = today - timedelta(days=fetch_days)
 
     indices = []
-    for offset in range(fetch_days):
+    for offset in range(fetch_days + 1):
         day = today - timedelta(days=offset)
         idx = f"{es_index_prefix}-{day.strftime('%Y.%m.%d')}"
         if es.indices.exists(index=idx):
             indices.append(idx)
-            print(f"{idx}")
+            print(f"Found: {idx}")
         else:
-            print(f"{idx} missing — skipping")
+            print(f"Missing: {idx} — skipping")
 
     if not indices:
         raise RuntimeError(f"No indices found for the last {fetch_days} days.")
@@ -57,56 +60,40 @@ def fetch_hourly_aggregated(
                         "range": {
                             "@timestamp": {
                                 "gte": since.isoformat(),
-                                "lte": today.isoformat(),
+                                "lte": (today + timedelta(days=1)).isoformat(),
                             }
                         }
                     },
                     {"term": {"flow.final": True}}
-                ],
-                "filter": [
-                    {
-                        "range": {
-                            "event.duration": {
-                                "lte": 3600000000000
-                            }
-                        }
-                    }
                 ]
             }
         },
         "aggs": {
-            "per_hour": {
+            "traffic_over_time": {
                 "date_histogram": {
                     "field":          "@timestamp",
-                    "fixed_interval": "1h",
-                    "min_doc_count":  1,
+                    "fixed_interval": bucket_interval,
+                    "min_doc_count":  0,
+                    "extended_bounds": {
+                        "min": since.isoformat(),
+                        "max": today.isoformat(),
+                    },
                 },
                 "aggs": {
+                    "avg_bytes":     {"avg":         {"field": "network.bytes"}},
                     "total_bytes":   {"sum":         {"field": "network.bytes"}},
                     "total_packets": {"sum":         {"field": "network.packets"}},
                     "unique_flows":  {"cardinality": {"field": "flow.id.keyword"}},
                     "avg_duration":  {"avg":         {"field": "event.duration"}},
                     "src_bytes":     {"sum":         {"field": "source.bytes"}},
                     "dst_bytes":     {"sum":         {"field": "destination.bytes"}},
-                    "avg_bpp": {
-                        "avg": {
-                            "script": {
-                                "source": (
-                                    "doc['network.bytes'].size() > 0 && "
-                                    "doc['network.packets'].size() > 0 "
-                                    "? doc['network.bytes'].value / (doc['network.packets'].value + 1) "
-                                    ": 0"
-                                )
-                            }
-                        }
-                    },
                 }
             }
         }
     }
 
     resp    = es.search(index=",".join(indices), body=query)
-    buckets = resp["aggregations"]["per_hour"]["buckets"]
+    buckets = resp["aggregations"]["traffic_over_time"]["buckets"]
 
     if not buckets:
         raise RuntimeError("No aggregation buckets returned — check index field names.")
@@ -115,13 +102,14 @@ def fetch_hourly_aggregated(
     for b in buckets:
         records.append({
             "timestamp":     b["key_as_string"],
+            "avg_bytes":     b["avg_bytes"]["value"]     or 0,
             "total_bytes":   b["total_bytes"]["value"]   or 0,
             "total_packets": b["total_packets"]["value"] or 0,
             "unique_flows":  b["unique_flows"]["value"]  or 0,
             "avg_duration":  b["avg_duration"]["value"]  or 0,
             "src_bytes":     b["src_bytes"]["value"]     or 0,
             "dst_bytes":     b["dst_bytes"]["value"]     or 0,
-            "bytes_per_pkt": b["avg_bpp"]["value"]       or 0,
+            "doc_count":     b["doc_count"],
         })
 
     df = pd.DataFrame(records)
@@ -129,91 +117,73 @@ def fetch_hourly_aggregated(
     df = df.sort_values("timestamp").reset_index(drop=True)
     df.to_csv(output_data.path, index=False)
 
-    print(f"Fetched {len(df)} hourly buckets across {len(indices)} indices")
+    print(f"Fetched {len(df)} buckets ({bucket_interval}) across {len(indices)} indices")
     print(f"Range: {df['timestamp'].min()} → {df['timestamp'].max()}")
-    print(df.tail(5).to_string(index=False))
+    print(f"avg_bytes stats: median={df['avg_bytes'].median():.0f}, "
+          f"p99={df['avg_bytes'].quantile(0.99):.0f}, max={df['avg_bytes'].max():.0f}")
 
 
 @component(
     base_image="python:3.9",
     packages_to_install=["pandas", "numpy", "boto3"]
 )
-def preprocess_and_save_history(
-    input_data:  Input[Dataset],
-    output_data: Output[Dataset],
+def preprocess_features(
+    input_data:    Input[Dataset],
+    output_data:   Output[Dataset],
     s3_endpoint:   str,
     s3_access_key: str,
     s3_secret_key: str,
     s3_bucket:     str,
     history_key:   str,
 ):
+    """Compute derived + temporal features, save history snapshot to S3."""
     import pandas as pd
     import numpy as np
     import boto3, io
     from botocore.client import Config
 
-    if not s3_endpoint:
-        raise ValueError("s3_endpoint is required")
-    if not s3_access_key:
-        raise ValueError("s3_access_key is required")
-    if not s3_secret_key:
-        raise ValueError("s3_secret_key is required")
-
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=s3_endpoint,
-        aws_access_key_id=s3_access_key,
-        aws_secret_access_key=s3_secret_key,
-        config=Config(signature_version="s3v4"),
-        region_name="us-east-1",
-    )
-
     df = pd.read_csv(input_data.path)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    print(f"Hourly rows before processing: {len(df)}")
-    print(f"Range: {df['timestamp'].min()} → {df['timestamp'].max()}")
+    print(f"Rows before processing: {len(df)}")
 
-    median_bytes = df["total_bytes"].median()
-    outlier_mask = df["total_bytes"] > (median_bytes * 3)
-    n_outliers   = outlier_mask.sum()
-    if n_outliers > 0:
-        print(f"Clipping {n_outliers} outlier hours to median ({median_bytes/1e6:.1f} MB)")
-        print(df[outlier_mask][["timestamp", "total_bytes"]].to_string(index=False))
-        df.loc[outlier_mask, "total_bytes"] = median_bytes
+    # --- Derived multivariate features (also used by InferenceService callers) ---
+    df["bytes_per_packet"] = df["total_bytes"] / df["total_packets"].replace(0, np.nan)
+    df["bytes_per_flow"]   = df["total_bytes"] / df["unique_flows"].replace(0, np.nan)
+    df["src_dst_ratio"]    = df["src_bytes"]   / df["dst_bytes"].replace(0, np.nan)
 
-    df["bytes_lag_1h"]   = df["total_bytes"].shift(1).fillna(df["total_bytes"])
-    df["bytes_lag_2h"]   = df["total_bytes"].shift(2).fillna(df["total_bytes"])
-    df["bytes_lag_3h"]   = df["total_bytes"].shift(3).fillna(df["total_bytes"])
-    df["bytes_lag_6h"]   = df["total_bytes"].shift(6).fillna(df["total_bytes"])
-    df["bytes_lag_12h"]  = df["total_bytes"].shift(12).fillna(df["total_bytes"])
-    df["bytes_lag_24h"]  = df["total_bytes"].shift(24).fillna(df["total_bytes"])
-    df["bytes_lag_168h"] = df["total_bytes"].shift(168).fillna(df["total_bytes"])
+    df[["bytes_per_packet", "bytes_per_flow", "src_dst_ratio"]] = \
+        df[["bytes_per_packet", "bytes_per_flow", "src_dst_ratio"]].fillna(0)
 
-    df["bytes_rolling_3h"]  = df["total_bytes"].rolling(3,   min_periods=1).mean()
-    df["bytes_rolling_6h"]  = df["total_bytes"].rolling(6,   min_periods=1).mean()
-    df["bytes_rolling_12h"] = df["total_bytes"].rolling(12,  min_periods=1).mean()
-    df["bytes_rolling_24h"] = df["total_bytes"].rolling(24,  min_periods=1).mean()
-    df["bytes_rolling_7d"]  = df["total_bytes"].rolling(168, min_periods=1).mean()
+    # --- Temporal context features (for ensemble detection + analytics) ---
+    df["hour_of_day"]   = df["timestamp"].dt.hour
+    df["day_of_week"]   = df["timestamp"].dt.dayofweek
+    df["is_weekend"]    = (df["day_of_week"] >= 5).astype(int)
+    df["minute_of_day"] = df["timestamp"].dt.hour * 4 + df["timestamp"].dt.minute // 15
+    df["mod_sin"]       = np.sin(2 * np.pi * df["minute_of_day"] / 96)
+    df["mod_cos"]       = np.cos(2 * np.pi * df["minute_of_day"] / 96)
 
-    # --- Time features ---
-    df["hour_of_day"] = df["timestamp"].dt.hour
-    df["day_of_week"] = df["timestamp"].dt.dayofweek
-    df["is_weekend"]  = (df["day_of_week"] >= 5).astype(int)
-    df["hour_sin"]    = np.sin(2 * np.pi * df["hour_of_day"] / 24)
-    df["hour_cos"]    = np.cos(2 * np.pi * df["hour_of_day"] / 24)
-    df["dow_sin"]     = np.sin(2 * np.pi * df["day_of_week"] / 7)
-    df["dow_cos"]     = np.cos(2 * np.pi * df["day_of_week"] / 7)
+    # --- Rolling stats (for z-score/IQR detectors, not used by IF) ---
+    df["roll_mean_4"]  = df["avg_bytes"].shift(1).rolling(4,  min_periods=1).mean()
+    df["roll_mean_16"] = df["avg_bytes"].shift(1).rolling(16, min_periods=1).mean()
+    df["roll_std_16"]  = df["avg_bytes"].shift(1).rolling(16, min_periods=1).std()
+    df["roll_mean_96"] = df["avg_bytes"].shift(1).rolling(96, min_periods=1).mean()
 
-    df["next_hour_bytes"] = df["total_bytes"].shift(-1)
+    df = df.fillna(0)
 
-    df = df.dropna(subset=["next_hour_bytes"]).reset_index(drop=True)
+    print(f"Rows after feature engineering: {len(df)}")
 
-    print(f"Training-ready rows after shift: {len(df)}  (last row dropped — no future target)")
-    print(f"Target range: {df['next_hour_bytes'].min():,.0f} → {df['next_hour_bytes'].max():,.0f} bytes")
-
+    # --- Save history snapshot to S3 ---
     try:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=s3_endpoint,
+            aws_access_key_id=s3_access_key,
+            aws_secret_access_key=s3_secret_key,
+            config=Config(signature_version="s3v4"),
+            region_name="us-east-1",
+        )
         buf = io.StringIO()
         df.to_csv(buf, index=False)
         s3.put_object(
@@ -222,7 +192,7 @@ def preprocess_and_save_history(
             Body=buf.getvalue().encode("utf-8"),
             ContentType="text/csv",
         )
-        print(f"History saved → s3://{s3_bucket}/{history_key}")
+        print(f"History snapshot → s3://{s3_bucket}/{history_key}")
     except Exception as e:
         print(f"Warning: could not save history to S3: {e}")
 
@@ -231,204 +201,220 @@ def preprocess_and_save_history(
 
 @component(
     base_image="python:3.9",
-    packages_to_install=["pandas", "numpy", "scikit-learn==1.5.2", "joblib==1.4.2", "xgboost"]
+    packages_to_install=["pandas", "numpy", "scikit-learn==1.5.2", "joblib==1.4.2"]
 )
-def train_model(
-    input_data:       Input[Dataset],
-    model_output:     Output[Model],
-    metrics:          Output[Metrics],
-    forecast_horizon: int,
+def train_anomaly_detector(
+    input_data:     Input[Dataset],
+    model_output:   Output[Model],
+    metrics:        Output[Metrics],
+    contamination:  float,
+    n_estimators:   int,
 ):
+    """
+    Train a single sklearn Pipeline that KServe's built-in sklearn runtime can load.
+
+    Pipeline structure:
+        ColumnTransformer(log1p on 4 cols, passthrough on 2) -> RobustScaler -> IsolationForest
+
+    The saved model.joblib uses only built-in sklearn/numpy references, so it
+    pickles and unpickles cleanly across environments — no custom code required.
+
+    Callers must send the 6 features in this exact order:
+        [avg_bytes, total_packets, unique_flows, bytes_per_flow, bytes_per_packet, src_dst_ratio]
+    """
     import pandas as pd
     import numpy as np
-    from sklearn.linear_model import Ridge
-    from sklearn.metrics import mean_absolute_error, mean_squared_error
-    import xgboost as xgb
-    import joblib, os, json
+    from sklearn.ensemble import IsolationForest
+    from sklearn.preprocessing import RobustScaler, FunctionTransformer
+    from sklearn.compose import ColumnTransformer
+    from sklearn.pipeline import Pipeline
+    import joblib, os, json, sklearn
 
     df = pd.read_csv(input_data.path)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp")
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    n_rows = len(df)
 
-    n_hours = len(df)
-    print(f"Training on {n_hours} hourly rows ({n_hours/24:.1f} days)")
+    print(f"Training on {n_rows} buckets")
+    print(f"sklearn version: {sklearn.__version__}")
 
-    feature_cols = [
-        "total_packets", "unique_flows", "avg_duration",
-        "src_bytes", "dst_bytes", "bytes_per_pkt",
-        "bytes_lag_1h", "bytes_lag_2h", "bytes_lag_3h",
-        "bytes_lag_6h", "bytes_lag_12h", "bytes_lag_24h", "bytes_lag_168h",
-        "bytes_rolling_3h", "bytes_rolling_6h",
-        "bytes_rolling_12h", "bytes_rolling_24h", "bytes_rolling_7d",
-        "hour_sin", "hour_cos", "dow_sin", "dow_cos", "is_weekend",
+    # Feature order — MUST match what callers send at inference time
+    FEATURE_COLS = [
+        "avg_bytes",        # 0 — log1p
+        "total_packets",    # 1 — log1p
+        "unique_flows",     # 2 — log1p
+        "bytes_per_flow",   # 3 — log1p
+        "bytes_per_packet", # 4 — passthrough
+        "src_dst_ratio",    # 5 — passthrough
     ]
 
-    target_col = "next_hour_bytes"
+    # Derivations callers must compute before calling the InferenceService:
+    CALLER_DERIVATIONS = {
+        "bytes_per_flow":   "total_bytes / unique_flows  (0 if denom == 0)",
+        "bytes_per_packet": "total_bytes / total_packets (0 if denom == 0)",
+        "src_dst_ratio":    "src_bytes / dst_bytes       (0 if denom == 0)",
+    }
 
-    X = df[feature_cols].fillna(0)
-    y = df[target_col]
+    X = df[FEATURE_COLS].values.astype(float)
 
-    if n_hours < 168:
-        print(f"Using Ridge regression ({n_hours} hours — below 168h XGBoost threshold)")
-        model_type = "ridge"
-        if n_hours > forecast_horizon:
-            split  = n_hours - forecast_horizon
-            model  = Ridge(alpha=1.0)
-            model.fit(X.iloc[:split], y.iloc[:split])
-            preds  = model.predict(X.iloc[split:])
-            y_test = y.iloc[split:]
-            mae    = mean_absolute_error(y_test, preds)
-            rmse   = np.sqrt(mean_squared_error(y_test, preds))
-            mape   = np.mean(np.abs((y_test.values - preds) / (y_test.values + 1))) * 100
-            model.fit(X, y)  # refit on all data
-        else:
-            model  = Ridge(alpha=1.0)
-            model.fit(X, y)
-            preds  = model.predict(X)
-            mae    = mean_absolute_error(y, preds)
-            rmse   = np.sqrt(mean_squared_error(y, preds))
-            mape   = np.mean(np.abs((y.values - preds) / (y.values + 1))) * 100
-    else:
-        print(f"Using XGBoost ({n_hours} hours)")
-        model_type = "xgboost"
-        split = n_hours - forecast_horizon
-        X_train, X_test = X.iloc[:split], X.iloc[split:]
-        y_train, y_test = y.iloc[:split], y.iloc[split:]
-        model = xgb.XGBRegressor(
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=5,
-            subsample=0.8,
-            colsample_bytree=0.8,
+    # ColumnTransformer: log1p on cols 0-3, passthrough on 4-5.
+    # FunctionTransformer(np.log1p) pickles cleanly because np.log1p is
+    # a resolvable numpy reference, not a user-defined function.
+    preprocess = ColumnTransformer([
+        ("log",         FunctionTransformer(np.log1p), [0, 1, 2, 3]),
+        ("passthrough", "passthrough",                 [4, 5]),
+    ])
+
+    pipeline = Pipeline([
+        ("preprocess", preprocess),
+        ("scale",      RobustScaler()),
+        ("detector",   IsolationForest(
+            contamination=contamination,
+            n_estimators=n_estimators,
             random_state=42,
-            verbosity=0,
-        )
-        model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
-        preds = model.predict(X_test)
-        mae   = mean_absolute_error(y_test, preds)
-        rmse  = np.sqrt(mean_squared_error(y_test, preds))
-        mape  = np.mean(np.abs((y_test.values - preds) / (y_test.values + 1))) * 100
+            n_jobs=-1,
+        )),
+    ])
 
-    print(f"MAE:  {mae:,.0f} bytes  ({mae/1e6:.2f} MB)")
-    print(f"RMSE: {rmse:,.0f} bytes  ({rmse/1e6:.2f} MB)")
-    print(f"MAPE: {mape:.2f}%")
+    pipeline.fit(X)
 
-    metrics.log_metric("MAE",            float(mae))
-    metrics.log_metric("RMSE",           float(rmse))
-    metrics.log_metric("MAPE",           float(mape))
-    metrics.log_metric("training_hours", float(n_hours))
-    metrics.log_metric("model_type",     model_type)
+    # --- Evaluation ---
+    preds       = pipeline.predict(X)
+    transformed = pipeline[:-1].transform(X)
+    scores      = -pipeline.named_steps["detector"].score_samples(transformed)
 
+    n_anomalies  = int((preds == -1).sum())
+    anomaly_rate = n_anomalies / n_rows
+
+    print(f"Flagged {n_anomalies} of {n_rows} ({anomaly_rate:.2%})")
+    print(f"Score range: {scores.min():.3f} → {scores.max():.3f}, mean={scores.mean():.3f}")
+
+    df_scored = df.copy()
+    df_scored["iso_score"] = scores
+    df_scored["iso_flag"]  = (preds == -1).astype(int)
+    top = df_scored.nlargest(10, "iso_score")[
+        ["timestamp", "avg_bytes", "unique_flows", "total_packets", "iso_score"]
+    ]
+    print("Top 10 anomaly candidates:")
+    print(top.to_string(index=False))
+
+    metrics.log_metric("n_buckets",        float(n_rows))
+    metrics.log_metric("n_anomalies",      float(n_anomalies))
+    metrics.log_metric("anomaly_rate_pct", float(anomaly_rate * 100))
+    metrics.log_metric("contamination",    float(contamination))
+    metrics.log_metric("score_mean",       float(scores.mean()))
+    metrics.log_metric("score_max",        float(scores.max()))
+
+    # --- Save single model.joblib (KServe sklearn runtime compatible) ---
     os.makedirs(model_output.path, exist_ok=True)
-    joblib.dump(model, os.path.join(model_output.path, "model.joblib"))
+    joblib.dump(pipeline, os.path.join(model_output.path, "model.joblib"))
 
-    if model_type == "xgboost":
-        booster = model.get_booster()
-        booster.feature_names = None
-        booster.feature_types = None
-        booster.save_model(os.path.join(model_output.path, "model.json"))
+    with open(os.path.join(model_output.path, "feature_order.json"), "w") as f:
+        json.dump({
+            "features_in_order":  FEATURE_COLS,
+            "caller_derivations": CALLER_DERIVATIONS,
+            "sklearn_version":    sklearn.__version__,
+            "output_semantics":   {"1": "normal", "-1": "anomaly"},
+        }, f, indent=2)
 
-    with open(os.path.join(model_output.path, "features.json"), "w") as f:
-        json.dump(feature_cols, f)
-
-    with open(os.path.join(model_output.path, "model_type.json"), "w") as f:
-        json.dump({"type": model_type}, f)
-
-    print(f"Model ({model_type}) saved ✓")
-    print(f"Target: next_hour_bytes (true 1-hour ahead forecast)")
+    print("Saved → model.joblib (KServe-compatible sklearn Pipeline)")
 
 
 @component(
     base_image="python:3.9",
-    packages_to_install=["pandas", "numpy", "scikit-learn==1.5.2", "joblib==1.4.2", "xgboost", "boto3"]
+    packages_to_install=["pandas", "numpy", "scikit-learn==1.5.2", "joblib==1.4.2", "boto3"]
 )
-def forecast_and_store_s3(
-    input_data:       Input[Dataset],
-    model_input:      Input[Model],
-    s3_endpoint:      str,
-    s3_access_key:    str,
-    s3_secret_key:    str,
-    s3_bucket:        str,
-    forecast_horizon: int,
+def detect_anomalies_and_store(
+    input_data:         Input[Dataset],
+    model_input:        Input[Model],
+    s3_endpoint:        str,
+    s3_access_key:      str,
+    s3_secret_key:      str,
+    s3_bucket:          str,
+    zscore_threshold:   float,
+    min_abs_deviation:  float,
+    iqr_multiplier:     float,
+    rolling_window:     int,
 ):
+    """
+    Run ensemble: sklearn Pipeline (IF) + rolling z-score + rolling IQR.
+    Store scored results, anomalies, summary, and model.joblib to S3.
+    """
     import pandas as pd
     import numpy as np
-    import joblib, os, json, tempfile
-    from datetime import datetime, timedelta
+    import joblib, os, json, io
+    from datetime import datetime
     import boto3
     from botocore.client import Config
-    import io
 
     df = pd.read_csv(input_data.path)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp")
+    df = df.sort_values("timestamp").reset_index(drop=True)
 
-    model = joblib.load(os.path.join(model_input.path, "model.joblib"))
+    # Load single-file sklearn Pipeline
+    pipeline_path = os.path.join(model_input.path, "model.joblib")
+    pipeline      = joblib.load(pipeline_path)
 
-    with open(os.path.join(model_input.path, "features.json")) as f:
-        feature_cols = json.load(f)
+    with open(os.path.join(model_input.path, "feature_order.json")) as f:
+        feat_meta = json.load(f)
+    FEATURE_COLS = feat_meta["features_in_order"]
 
-    with open(os.path.join(model_input.path, "model_type.json")) as f:
-        model_type = json.load(f)["type"]
+    # --- Detector 1: Isolation Forest (via Pipeline) ---
+    X = df[FEATURE_COLS].values.astype(float)
+    df["anomaly_iso"] = (pipeline.predict(X) == -1).astype(int)
+    df["iso_score"]   = -pipeline.named_steps["detector"].score_samples(
+        pipeline[:-1].transform(X)
+    )
 
-    print(f"Model type: {model_type}")
-    print(f"Forecasting {forecast_horizon} hours ahead from {df['timestamp'].max()}")
+    # --- Detector 2: Rolling z-score on avg_bytes ---
+    roll_mean = df["avg_bytes"].shift(1).rolling(rolling_window, min_periods=8).mean()
+    roll_std  = df["avg_bytes"].shift(1).rolling(rolling_window, min_periods=8).std()
+    df["zscore"] = (df["avg_bytes"] - roll_mean) / roll_std.replace(0, np.nan)
+    df["anomaly_zscore"] = (
+        (df["zscore"].abs() > zscore_threshold)
+        & ((df["avg_bytes"] - roll_mean).abs() > min_abs_deviation)
+    ).fillna(False).astype(int)
 
-    last_row = df.iloc[-1].copy()
-    history  = df["total_bytes"].tolist()
-    forecasts = []
+    # --- Detector 3: Rolling IQR ---
+    q1 = df["avg_bytes"].shift(1).rolling(rolling_window, min_periods=8).quantile(0.25)
+    q3 = df["avg_bytes"].shift(1).rolling(rolling_window, min_periods=8).quantile(0.75)
+    iqr = q3 - q1
+    upper_bound = q3 + iqr_multiplier * iqr
+    df["anomaly_iqr"] = (df["avg_bytes"] > upper_bound).fillna(False).astype(int)
 
-    for i in range(1, forecast_horizon + 1):
-        future_ts   = last_row["timestamp"] + timedelta(hours=i)
-        hour_of_day = future_ts.hour
-        day_of_week = future_ts.dayofweek
+    # --- Ensemble ---
+    df["anomaly_count"]     = df[["anomaly_iso", "anomaly_zscore", "anomaly_iqr"]].sum(axis=1)
+    df["anomaly_consensus"] = (df["anomaly_count"] >= 2).astype(int)
 
-        row = {
-            "total_packets":     last_row["total_packets"],
-            "unique_flows":      last_row["unique_flows"],
-            "avg_duration":      last_row["avg_duration"],
-            "src_bytes":         last_row["src_bytes"],
-            "dst_bytes":         last_row["dst_bytes"],
-            "bytes_per_pkt":     last_row["bytes_per_pkt"],
-            "bytes_lag_1h":      history[-1],
-            "bytes_lag_2h":      history[-2]   if len(history) >= 2   else history[-1],
-            "bytes_lag_3h":      history[-3]   if len(history) >= 3   else history[-1],
-            "bytes_lag_6h":      history[-6]   if len(history) >= 6   else history[-1],
-            "bytes_lag_12h":     history[-12]  if len(history) >= 12  else history[-1],
-            "bytes_lag_24h":     history[-24]  if len(history) >= 24  else history[-1],
-            "bytes_lag_168h":    history[-168] if len(history) >= 168 else history[-1],
-            "bytes_rolling_3h":  np.mean(history[-3:]),
-            "bytes_rolling_6h":  np.mean(history[-6:]),
-            "bytes_rolling_12h": np.mean(history[-12:]),
-            "bytes_rolling_24h": np.mean(history[-24:]),
-            "bytes_rolling_7d":  np.mean(history[-168:]),
-            "hour_sin":          np.sin(2 * np.pi * hour_of_day / 24),
-            "hour_cos":          np.cos(2 * np.pi * hour_of_day / 24),
-            "dow_sin":           np.sin(2 * np.pi * day_of_week / 7),
-            "dow_cos":           np.cos(2 * np.pi * day_of_week / 7),
-            "is_weekend":        int(day_of_week >= 5),
-        }
+    def severity(row):
+        if row["anomaly_count"] == 0: return "normal"
+        if row["anomaly_count"] == 3: return "critical"
+        if row["anomaly_count"] == 2: return "high"
+        return "low"
 
-        pred = float(model.predict(pd.DataFrame([row]))[0])
-        pred = max(0, pred)
+    df["severity"] = df.apply(severity, axis=1)
 
-        forecasts.append({
-            "timestamp":      future_ts.isoformat(),
-            "forecast_bytes": pred,
-            "forecast_mb":    round(pred / 1e6, 2),
-            "forecast_mbps":  round(pred * 8 / 3600 / 1e6, 4),
-            "generated_at":   datetime.utcnow().isoformat(),
-            "training_hours": len(df),
-            "horizon_step":   i,
-            "horizon_hours":  forecast_horizon,
-            "model_type":     model_type,
-        })
+    n_total     = len(df)
+    n_iso       = int(df["anomaly_iso"].sum())
+    n_zscore    = int(df["anomaly_zscore"].sum())
+    n_iqr       = int(df["anomaly_iqr"].sum())
+    n_consensus = int(df["anomaly_consensus"].sum())
 
-        history.append(pred)
+    print(f"Total buckets:    {n_total}")
+    print(f"Isolation Forest: {n_iso}")
+    print(f"Z-score:          {n_zscore}")
+    print(f"IQR:              {n_iqr}")
+    print(f"Consensus (>=2):  {n_consensus}")
+    print(f"Agreement dist:\n{df['anomaly_count'].value_counts().sort_index().to_string()}")
 
-    forecast_df = pd.DataFrame(forecasts)
-    print(forecast_df[["timestamp", "forecast_bytes", "forecast_mb", "forecast_mbps"]].to_string(index=False))
+    consensus = df[df["anomaly_consensus"] == 1].copy()
+    if len(consensus) > 0:
+        print("\nConsensus anomalies:")
+        cols = ["timestamp", "avg_bytes", "unique_flows", "total_packets",
+                "iso_score", "zscore", "anomaly_count", "severity"]
+        print(consensus[cols].to_string(index=False))
 
+    # --- S3 setup ---
     s3 = boto3.client(
         "s3",
         endpoint_url=s3_endpoint,
@@ -443,78 +429,106 @@ def forecast_and_store_s3(
         s3.create_bucket(Bucket=s3_bucket)
         print(f"Created bucket: {s3_bucket}")
 
-    run_ts     = datetime.utcnow().strftime("%Y-%m-%dT%H-%M")
-    csv_buf    = io.StringIO()
-    forecast_df.to_csv(csv_buf, index=False)
-    csv_bytes  = csv_buf.getvalue().encode("utf-8")
-    json_bytes = json.dumps(forecasts, indent=2).encode("utf-8")
+    run_ts = datetime.utcnow().strftime("%Y-%m-%dT%H-%M")
 
-    s3.put_object(Bucket=s3_bucket, Key=f"forecasts/{run_ts}/forecast.csv",
-                  Body=csv_bytes, ContentType="text/csv")
-    s3.put_object(Bucket=s3_bucket, Key=f"forecasts/{run_ts}/forecast.json",
-                  Body=json_bytes, ContentType="application/json")
-    s3.put_object(Bucket=s3_bucket, Key="forecasts/latest/forecast.csv",
-                  Body=csv_bytes, ContentType="text/csv")
-    s3.put_object(Bucket=s3_bucket, Key="forecasts/latest/forecast.json",
-                  Body=json_bytes, ContentType="application/json")
+    full_buf = io.StringIO(); df.to_csv(full_buf, index=False)
+    full_bytes = full_buf.getvalue().encode("utf-8")
 
-    model_buf = io.BytesIO()
-    joblib.dump(model, model_buf)
-    model_buf.seek(0)
-    model_bytes = model_buf.read()
+    anomalies = df[df["anomaly_count"] > 0].copy()
+    alert_cols = [
+        "timestamp", "avg_bytes", "total_bytes", "total_packets", "unique_flows",
+        "bytes_per_flow", "bytes_per_packet", "src_dst_ratio",
+        "iso_score", "zscore",
+        "anomaly_iso", "anomaly_zscore", "anomaly_iqr",
+        "anomaly_count", "anomaly_consensus", "severity",
+    ]
+    anomaly_buf = io.StringIO(); anomalies[alert_cols].to_csv(anomaly_buf, index=False)
+    anomaly_bytes = anomaly_buf.getvalue().encode("utf-8")
+    anomaly_json  = json.dumps(
+        anomalies[alert_cols].assign(
+            timestamp=anomalies["timestamp"].astype(str)
+        ).to_dict(orient="records"),
+        indent=2,
+    ).encode("utf-8")
 
-    s3.put_object(Bucket=s3_bucket, Key=f"models/{run_ts}/model.joblib",
-                  Body=model_bytes, ContentType="application/octet-stream")
-    s3.put_object(Bucket=s3_bucket, Key=f"models/{run_ts}/features.json",
-                  Body=json.dumps(feature_cols).encode(), ContentType="application/json")
-    s3.put_object(Bucket=s3_bucket, Key=f"models/{run_ts}/model_type.json",
-                  Body=json.dumps({"type": model_type}).encode(), ContentType="application/json")
-    s3.put_object(Bucket=s3_bucket, Key="models/latest/model.joblib",
-                  Body=model_bytes, ContentType="application/octet-stream")
-    s3.put_object(Bucket=s3_bucket, Key="models/latest/features.json",
-                  Body=json.dumps(feature_cols).encode(), ContentType="application/json")
-    s3.put_object(Bucket=s3_bucket, Key="models/latest/model_type.json",
-                  Body=json.dumps({"type": model_type}).encode(), ContentType="application/json")
+    summary = {
+        "run_timestamp":    run_ts,
+        "generated_at":     datetime.utcnow().isoformat(),
+        "n_buckets":        n_total,
+        "n_iso":            n_iso,
+        "n_zscore":         n_zscore,
+        "n_iqr":            n_iqr,
+        "n_consensus":      n_consensus,
+        "n_critical":       int((df["severity"] == "critical").sum()),
+        "time_range_start": str(df["timestamp"].min()),
+        "time_range_end":   str(df["timestamp"].max()),
+    }
+    summary_bytes = json.dumps(summary, indent=2).encode("utf-8")
 
-    if model_type == "xgboost":
-        with tempfile.TemporaryDirectory() as tmp:
-            xgb_path = os.path.join(tmp, "model.json")
-            booster = model.get_booster()
-            booster.feature_names = None
-            booster.feature_types = None
-            model.save_model(xgb_path)
-            with open(xgb_path, "rb") as f:
-                xgb_bytes = f.read()
-        s3.put_object(Bucket=s3_bucket, Key=f"models/{run_ts}/model.json",
-                      Body=xgb_bytes, ContentType="application/json")
-        s3.put_object(Bucket=s3_bucket, Key="models/latest/model.json",
-                      Body=xgb_bytes, ContentType="application/json")
-        print(f"XGBoost model.json saved ✓")
+    with open(pipeline_path, "rb") as f:
+        model_bytes = f.read()
+    with open(os.path.join(model_input.path, "feature_order.json"), "rb") as f:
+        feat_bytes = f.read()
+
+    # --- Write both timestamped and 'latest' copies ---
+    for key_prefix in [f"anomalies/{run_ts}", "anomalies/latest"]:
+        s3.put_object(Bucket=s3_bucket, Key=f"{key_prefix}/all_scored.csv",
+                      Body=full_bytes, ContentType="text/csv")
+        s3.put_object(Bucket=s3_bucket, Key=f"{key_prefix}/anomalies.csv",
+                      Body=anomaly_bytes, ContentType="text/csv")
+        s3.put_object(Bucket=s3_bucket, Key=f"{key_prefix}/anomalies.json",
+                      Body=anomaly_json, ContentType="application/json")
+        s3.put_object(Bucket=s3_bucket, Key=f"{key_prefix}/summary.json",
+                      Body=summary_bytes, ContentType="application/json")
+
+    # Model artifacts — KServe InferenceService reads from models/latest/
+    for key_prefix in [f"models/{run_ts}", "models/latest"]:
+        s3.put_object(Bucket=s3_bucket, Key=f"{key_prefix}/model.joblib",
+                      Body=model_bytes, ContentType="application/octet-stream")
+        s3.put_object(Bucket=s3_bucket, Key=f"{key_prefix}/feature_order.json",
+                      Body=feat_bytes, ContentType="application/json")
+
+    print(f"Results → s3://{s3_bucket}/anomalies/{run_ts}/ and /anomalies/latest/")
+    print(f"Model   → s3://{s3_bucket}/models/{run_ts}/ and /models/latest/")
+    print(f"KServe  → point InferenceService storageUri at s3://{s3_bucket}/models/latest/")
 
 
 @pipeline(
-    name="packetbeat-traffic-forecasting-hourly",
-    description="Hourly ES aggregation (flow.final:true) → feature engineering → train on next_hour_bytes → forecast → S3",
+    name="packetbeat-traffic-anomaly-detection",
+    description=(
+        "15-min ES aggregation (flow.final:true) -> feature engineering -> "
+        "sklearn Pipeline training (KServe-compatible) -> ensemble detection -> S3"
+    ),
 )
-def traffic_forecasting_pipeline(
-    es_host:          str   = "",
-    es_user:          str   = "",
-    es_password:      str   = "",
-    es_index_prefix:  str   = "packetbeat-free5gc",
-    fetch_days:       int   = 9,
-    forecast_horizon: int   = 24,
-    s3_endpoint:      str   = "",
-    s3_access_key:    str   = "",
-    s3_secret_key:    str   = "",
-    s3_bucket:        str   = "traffic-forecasts",
-    history_key:      str   = "history/hourly_aggregated.csv",
+def anomaly_detection_pipeline(
+    es_host:           str   = "",
+    es_user:           str   = "",
+    es_password:       str   = "",
+    es_index_prefix:   str   = "packetbeat-free5gc",
+    fetch_days:        int   = 3,
+    bucket_interval:   str   = "15m",
+    # Isolation Forest params
+    contamination:     float = 0.02,
+    n_estimators:      int   = 200,
+    # Ensemble params
+    zscore_threshold:  float = 3.0,
+    min_abs_deviation: float = 1000.0,
+    iqr_multiplier:    float = 3.0,
+    rolling_window:    int   = 24,
+    # S3 config
+    s3_endpoint:       str   = "",
+    s3_access_key:     str   = "",
+    s3_secret_key:     str   = "",
+    s3_bucket:         str   = "traffic-anomalies",
+    history_key:       str   = "history/aggregated_15m.csv",
 ):
-    fetch_task = fetch_hourly_aggregated(
+    fetch_task = fetch_traffic_data(
         es_host=es_host,
         es_user=es_user,
         es_password=es_password,
         es_index_prefix=es_index_prefix,
         fetch_days=fetch_days,
+        bucket_interval=bucket_interval,
     )
     fetch_task.set_caching_options(False)
     fetch_task.set_memory_limit("512Mi")
@@ -522,7 +536,7 @@ def traffic_forecasting_pipeline(
     fetch_task.set_cpu_limit("0.5")
     fetch_task.set_cpu_request("0.25")
 
-    preprocess_task = preprocess_and_save_history(
+    preprocess_task = preprocess_features(
         input_data=fetch_task.outputs["output_data"],
         s3_endpoint=s3_endpoint,
         s3_access_key=s3_access_key,
@@ -535,34 +549,39 @@ def traffic_forecasting_pipeline(
     preprocess_task.set_memory_request("512Mi")
     preprocess_task.set_cpu_limit("1")
 
-    train_task = train_model(
+    train_task = train_anomaly_detector(
         input_data=preprocess_task.outputs["output_data"],
-        forecast_horizon=forecast_horizon,
+        contamination=contamination,
+        n_estimators=n_estimators,
     )
     train_task.set_caching_options(False)
-    train_task.set_memory_limit("4G")
-    train_task.set_memory_request("2G")
+    train_task.set_memory_limit("2G")
+    train_task.set_memory_request("1G")
     train_task.set_cpu_limit("2")
 
-    forecast_task = forecast_and_store_s3(
+    detect_task = detect_anomalies_and_store(
         input_data=preprocess_task.outputs["output_data"],
         model_input=train_task.outputs["model_output"],
         s3_endpoint=s3_endpoint,
         s3_access_key=s3_access_key,
         s3_secret_key=s3_secret_key,
         s3_bucket=s3_bucket,
-        forecast_horizon=forecast_horizon,
+        zscore_threshold=zscore_threshold,
+        min_abs_deviation=min_abs_deviation,
+        iqr_multiplier=iqr_multiplier,
+        rolling_window=rolling_window,
     )
-    forecast_task.set_caching_options(False)
-    forecast_task.set_memory_limit("1G")
-    forecast_task.set_memory_request("512Mi")
-    forecast_task.set_cpu_limit("1")
+    detect_task.set_caching_options(False)
+    detect_task.set_memory_limit("1G")
+    detect_task.set_memory_request("512Mi")
+    detect_task.set_cpu_limit("1")
 
 
-from kfp import compiler
+if __name__ == "__main__":
+    from kfp import compiler
 
-compiler.Compiler().compile(
-    pipeline_func=traffic_forecasting_pipeline,
-    package_path="traffic_forecasting_pipeline_hourly.yaml"
-)
-print("Compiled → traffic_forecasting_pipeline_hourly.yaml")
+    compiler.Compiler().compile(
+        pipeline_func=anomaly_detection_pipeline,
+        package_path="anomaly_detection_pipeline.yaml",
+    )
+    print("Compiled → anomaly_detection_pipeline.yaml")
