@@ -4,7 +4,7 @@ from kfp.dsl import component, pipeline, Input, Output, Dataset, Model, Metrics
 
 @component(
     base_image="python:3.9",
-    packages_to_install=["elasticsearch==8.12.0", "pandas", "scikit-learn==1.5.2", "joblib==1.4.2", "xgboost"]
+    packages_to_install=["elasticsearch==8.12.0", "pandas"]
 )
 def fetch_hourly_aggregated(
     es_host:         str,
@@ -136,7 +136,7 @@ def fetch_hourly_aggregated(
 
 @component(
     base_image="python:3.9",
-    packages_to_install=["pandas", "numpy", "boto3", "scikit-learn==1.5.2", "joblib==1.4.2", "xgboost"]
+    packages_to_install=["pandas", "numpy", "boto3"]
 )
 def preprocess_and_save_history(
     input_data:  Input[Dataset],
