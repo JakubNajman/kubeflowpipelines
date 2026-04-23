@@ -60,7 +60,8 @@ def fetch_hourly_aggregated(
                                 "lte": today.isoformat(),
                             }
                         }
-                    }
+                    },
+                    {"term": {"flow.final": True}}
                 ],
                 "filter": [
                     {
