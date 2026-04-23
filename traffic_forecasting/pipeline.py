@@ -4,7 +4,7 @@ from kfp.dsl import component, pipeline, Input, Output, Dataset, Model, Metrics
 
 @component(
     base_image="python:3.9",
-    packages_to_install=["elasticsearch==8.12.0", "pandas"]
+    packages_to_install=["elasticsearch==8.12.0", "pandas", "scikit-learn==1.5.2", "joblib==1.4.2", "xgboost"]
 )
 def fetch_hourly_aggregated(
     es_host:         str,
@@ -136,7 +136,7 @@ def fetch_hourly_aggregated(
 
 @component(
     base_image="python:3.9",
-    packages_to_install=["pandas", "numpy", "boto3"]
+    packages_to_install=["pandas", "numpy", "boto3", "scikit-learn==1.5.2", "joblib==1.4.2", "xgboost"]
 )
 def preprocess_and_save_history(
     input_data:  Input[Dataset],
@@ -231,7 +231,7 @@ def preprocess_and_save_history(
 
 @component(
     base_image="python:3.9",
-    packages_to_install=["pandas", "numpy", "scikit-learn", "xgboost", "joblib"]
+    packages_to_install=["pandas", "numpy", "scikit-learn==1.5.2", "joblib==1.4.2", "xgboost"]
 )
 def train_model(
     input_data:       Input[Dataset],
@@ -273,7 +273,7 @@ def train_model(
         model_type = "ridge"
         if n_hours > forecast_horizon:
             split  = n_hours - forecast_horizon
-            model  = Ridge(alpha=1e9)
+            model  = Ridge(alpha=1.0)
             model.fit(X.iloc[:split], y.iloc[:split])
             preds  = model.predict(X.iloc[split:])
             y_test = y.iloc[split:]
@@ -282,7 +282,7 @@ def train_model(
             mape   = np.mean(np.abs((y_test.values - preds) / (y_test.values + 1))) * 100
             model.fit(X, y)  # refit on all data
         else:
-            model  = Ridge(alpha=1e9)
+            model  = Ridge(alpha=1.0)
             model.fit(X, y)
             preds  = model.predict(X)
             mae    = mean_absolute_error(y, preds)
@@ -340,7 +340,7 @@ def train_model(
 
 @component(
     base_image="python:3.9",
-    packages_to_install=["pandas", "numpy", "joblib", "xgboost", "scikit-learn", "boto3"]
+    packages_to_install=["pandas", "numpy", "scikit-learn==1.5.2", "joblib==1.4.2", "xgboost", "boto3"]
 )
 def forecast_and_store_s3(
     input_data:       Input[Dataset],
