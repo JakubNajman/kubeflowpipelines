@@ -148,6 +148,7 @@ def preprocess_features(
 
     print(f"Rows before processing: {len(df)}")
 
+    # --- Derived multivariate features (also used by InferenceService callers) ---
     df["bytes_per_packet"] = df["total_bytes"] / df["total_packets"].replace(0, np.nan)
     df["bytes_per_flow"]   = df["total_bytes"] / df["unique_flows"].replace(0, np.nan)
     df["src_dst_ratio"]    = df["src_bytes"]   / df["dst_bytes"].replace(0, np.nan)
@@ -155,13 +156,15 @@ def preprocess_features(
     df[["bytes_per_packet", "bytes_per_flow", "src_dst_ratio"]] = \
         df[["bytes_per_packet", "bytes_per_flow", "src_dst_ratio"]].fillna(0)
 
-    df["hour_of_day"]  = df["timestamp"].dt.hour
-    df["day_of_week"]  = df["timestamp"].dt.dayofweek
-    df["is_weekend"]   = (df["day_of_week"] >= 5).astype(int)
+    # --- Temporal context features (for ensemble detection + analytics) ---
+    df["hour_of_day"]   = df["timestamp"].dt.hour
+    df["day_of_week"]   = df["timestamp"].dt.dayofweek
+    df["is_weekend"]    = (df["day_of_week"] >= 5).astype(int)
     df["minute_of_day"] = df["timestamp"].dt.hour * 4 + df["timestamp"].dt.minute // 15
-    df["mod_sin"]      = np.sin(2 * np.pi * df["minute_of_day"] / 96)
-    df["mod_cos"]      = np.cos(2 * np.pi * df["minute_of_day"] / 96)
+    df["mod_sin"]       = np.sin(2 * np.pi * df["minute_of_day"] / 96)
+    df["mod_cos"]       = np.cos(2 * np.pi * df["minute_of_day"] / 96)
 
+    # --- Rolling stats (for z-score/IQR detectors, not used by IF) ---
     df["roll_mean_4"]  = df["avg_bytes"].shift(1).rolling(4,  min_periods=1).mean()
     df["roll_mean_16"] = df["avg_bytes"].shift(1).rolling(16, min_periods=1).mean()
     df["roll_std_16"]  = df["avg_bytes"].shift(1).rolling(16, min_periods=1).std()
@@ -170,8 +173,8 @@ def preprocess_features(
     df = df.fillna(0)
 
     print(f"Rows after feature engineering: {len(df)}")
-    print(f"Features: {list(df.columns)}")
 
+    # --- Save history snapshot to S3 ---
     try:
         s3 = boto3.client(
             "s3",
@@ -207,57 +210,89 @@ def train_anomaly_detector(
     contamination:  float,
     n_estimators:   int,
 ):
+    """
+    Train a single sklearn Pipeline that KServe's built-in sklearn runtime can load.
+
+    Pipeline structure:
+        ColumnTransformer(log1p on 4 cols, passthrough on 2) -> RobustScaler -> IsolationForest
+
+    The saved model.joblib uses only built-in sklearn/numpy references, so it
+    pickles and unpickles cleanly across environments — no custom code required.
+
+    Callers must send the 6 features in this exact order:
+        [avg_bytes, total_packets, unique_flows, bytes_per_flow, bytes_per_packet, src_dst_ratio]
+    """
     import pandas as pd
     import numpy as np
     from sklearn.ensemble import IsolationForest
-    from sklearn.preprocessing import RobustScaler
-    import joblib, os, json
+    from sklearn.preprocessing import RobustScaler, FunctionTransformer
+    from sklearn.compose import ColumnTransformer
+    from sklearn.pipeline import Pipeline
+    import joblib, os, json, sklearn
 
     df = pd.read_csv(input_data.path)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.sort_values("timestamp").reset_index(drop=True)
-
     n_rows = len(df)
-    print(f"Training on {n_rows} buckets")
 
-    # Features used by Isolation Forest
-    feature_cols = [
-        "avg_bytes", "total_packets", "unique_flows",
-        "bytes_per_flow", "bytes_per_packet", "src_dst_ratio",
+    print(f"Training on {n_rows} buckets")
+    print(f"sklearn version: {sklearn.__version__}")
+
+    # Feature order — MUST match what callers send at inference time
+    FEATURE_COLS = [
+        "avg_bytes",        # 0 — log1p
+        "total_packets",    # 1 — log1p
+        "unique_flows",     # 2 — log1p
+        "bytes_per_flow",   # 3 — log1p
+        "bytes_per_packet", # 4 — passthrough
+        "src_dst_ratio",    # 5 — passthrough
     ]
 
-    log_cols = ["avg_bytes", "total_packets", "unique_flows", "bytes_per_flow"]
+    # Derivations callers must compute before calling the InferenceService:
+    CALLER_DERIVATIONS = {
+        "bytes_per_flow":   "total_bytes / unique_flows  (0 if denom == 0)",
+        "bytes_per_packet": "total_bytes / total_packets (0 if denom == 0)",
+        "src_dst_ratio":    "src_bytes / dst_bytes       (0 if denom == 0)",
+    }
 
-    X = df[feature_cols].copy().fillna(0)
-    for col in log_cols:
-        X[col] = np.log1p(X[col].clip(lower=0))
+    X = df[FEATURE_COLS].values.astype(float)
 
-    scaler = RobustScaler()
-    X_scaled = scaler.fit_transform(X)
+    # ColumnTransformer: log1p on cols 0-3, passthrough on 4-5.
+    # FunctionTransformer(np.log1p) pickles cleanly because np.log1p is
+    # a resolvable numpy reference, not a user-defined function.
+    preprocess = ColumnTransformer([
+        ("log",         FunctionTransformer(np.log1p), [0, 1, 2, 3]),
+        ("passthrough", "passthrough",                 [4, 5]),
+    ])
 
-    iso = IsolationForest(
-        contamination=contamination,
-        n_estimators=n_estimators,
-        random_state=42,
-        n_jobs=-1,
-    )
-    iso.fit(X_scaled)
+    pipeline = Pipeline([
+        ("preprocess", preprocess),
+        ("scale",      RobustScaler()),
+        ("detector",   IsolationForest(
+            contamination=contamination,
+            n_estimators=n_estimators,
+            random_state=42,
+            n_jobs=-1,
+        )),
+    ])
 
-    preds  = iso.predict(X_scaled)
-    scores = -iso.score_samples(X_scaled)  # higher = more anomalous
+    pipeline.fit(X)
 
-    n_anomalies = int((preds == -1).sum())
+    # --- Evaluation ---
+    preds       = pipeline.predict(X)
+    transformed = pipeline[:-1].transform(X)
+    scores      = -pipeline.named_steps["detector"].score_samples(transformed)
+
+    n_anomalies  = int((preds == -1).sum())
     anomaly_rate = n_anomalies / n_rows
 
-    print(f"Flagged {n_anomalies} anomalies out of {n_rows} ({anomaly_rate:.2%})")
-    print(f"Anomaly score: min={scores.min():.3f}, max={scores.max():.3f}, "
-          f"mean={scores.mean():.3f}")
+    print(f"Flagged {n_anomalies} of {n_rows} ({anomaly_rate:.2%})")
+    print(f"Score range: {scores.min():.3f} → {scores.max():.3f}, mean={scores.mean():.3f}")
 
-    # Show top anomalies for logs
-    df_with_flags = df.copy()
-    df_with_flags["iso_score"] = scores
-    df_with_flags["iso_flag"]  = (preds == -1).astype(int)
-    top = df_with_flags.nlargest(10, "iso_score")[
+    df_scored = df.copy()
+    df_scored["iso_score"] = scores
+    df_scored["iso_flag"]  = (preds == -1).astype(int)
+    top = df_scored.nlargest(10, "iso_score")[
         ["timestamp", "avg_bytes", "unique_flows", "total_packets", "iso_score"]
     ]
     print("Top 10 anomaly candidates:")
@@ -270,13 +305,19 @@ def train_anomaly_detector(
     metrics.log_metric("score_mean",       float(scores.mean()))
     metrics.log_metric("score_max",        float(scores.max()))
 
+    # --- Save single model.joblib (KServe sklearn runtime compatible) ---
     os.makedirs(model_output.path, exist_ok=True)
-    joblib.dump(iso,    os.path.join(model_output.path, "iso_forest.joblib"))
-    joblib.dump(scaler, os.path.join(model_output.path, "scaler.joblib"))
-    with open(os.path.join(model_output.path, "features.json"), "w") as f:
-        json.dump({"features": feature_cols, "log_cols": log_cols}, f)
+    joblib.dump(pipeline, os.path.join(model_output.path, "model.joblib"))
 
-    print("Model + scaler + features saved ✓")
+    with open(os.path.join(model_output.path, "feature_order.json"), "w") as f:
+        json.dump({
+            "features_in_order":  FEATURE_COLS,
+            "caller_derivations": CALLER_DERIVATIONS,
+            "sklearn_version":    sklearn.__version__,
+            "output_semantics":   {"1": "normal", "-1": "anomaly"},
+        }, f, indent=2)
+
+    print("Saved → model.joblib (KServe-compatible sklearn Pipeline)")
 
 
 @component(
@@ -295,7 +336,10 @@ def detect_anomalies_and_store(
     iqr_multiplier:     float,
     rolling_window:     int,
 ):
-    """Run ensemble: Isolation Forest + rolling z-score + rolling IQR, store to S3."""
+    """
+    Run ensemble: sklearn Pipeline (IF) + rolling z-score + rolling IQR.
+    Store scored results, anomalies, summary, and model.joblib to S3.
+    """
     import pandas as pd
     import numpy as np
     import joblib, os, json, io
@@ -307,22 +351,20 @@ def detect_anomalies_and_store(
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    # --- Load trained Isolation Forest ---
-    iso    = joblib.load(os.path.join(model_input.path, "iso_forest.joblib"))
-    scaler = joblib.load(os.path.join(model_input.path, "scaler.joblib"))
-    with open(os.path.join(model_input.path, "features.json")) as f:
-        feat_config  = json.load(f)
-    feature_cols = feat_config["features"]
-    log_cols     = feat_config["log_cols"]
+    # Load single-file sklearn Pipeline
+    pipeline_path = os.path.join(model_input.path, "model.joblib")
+    pipeline      = joblib.load(pipeline_path)
 
-    # --- Detector 1: Isolation Forest ---
-    X = df[feature_cols].copy().fillna(0)
-    for col in log_cols:
-        X[col] = np.log1p(X[col].clip(lower=0))
-    X_scaled = scaler.transform(X)
+    with open(os.path.join(model_input.path, "feature_order.json")) as f:
+        feat_meta = json.load(f)
+    FEATURE_COLS = feat_meta["features_in_order"]
 
-    df["iso_score"]   = -iso.score_samples(X_scaled)
-    df["anomaly_iso"] = (iso.predict(X_scaled) == -1).astype(int)
+    # --- Detector 1: Isolation Forest (via Pipeline) ---
+    X = df[FEATURE_COLS].values.astype(float)
+    df["anomaly_iso"] = (pipeline.predict(X) == -1).astype(int)
+    df["iso_score"]   = -pipeline.named_steps["detector"].score_samples(
+        pipeline[:-1].transform(X)
+    )
 
     # --- Detector 2: Rolling z-score on avg_bytes ---
     roll_mean = df["avg_bytes"].shift(1).rolling(rolling_window, min_periods=8).mean()
@@ -345,12 +387,9 @@ def detect_anomalies_and_store(
     df["anomaly_consensus"] = (df["anomaly_count"] >= 2).astype(int)
 
     def severity(row):
-        if row["anomaly_count"] == 0:
-            return "normal"
-        if row["anomaly_count"] == 3:
-            return "critical"
-        if row["anomaly_count"] == 2:
-            return "high"
+        if row["anomaly_count"] == 0: return "normal"
+        if row["anomaly_count"] == 3: return "critical"
+        if row["anomaly_count"] == 2: return "high"
         return "low"
 
     df["severity"] = df.apply(severity, axis=1)
@@ -361,27 +400,21 @@ def detect_anomalies_and_store(
     n_iqr       = int(df["anomaly_iqr"].sum())
     n_consensus = int(df["anomaly_consensus"].sum())
 
-    print(f"Total buckets:       {n_total}")
-    print(f"Isolation Forest:    {n_iso}")
-    print(f"Z-score:             {n_zscore}")
-    print(f"IQR:                 {n_iqr}")
-    print(f"Consensus (≥2):      {n_consensus}")
-    print(f"Critical (all 3):    {int((df['severity'] == 'critical').sum())}")
+    print(f"Total buckets:    {n_total}")
+    print(f"Isolation Forest: {n_iso}")
+    print(f"Z-score:          {n_zscore}")
+    print(f"IQR:              {n_iqr}")
+    print(f"Consensus (>=2):  {n_consensus}")
+    print(f"Agreement dist:\n{df['anomaly_count'].value_counts().sort_index().to_string()}")
 
-    agreement = df["anomaly_count"].value_counts().sort_index()
-    print(f"Agreement distribution:\n{agreement.to_string()}")
-
-    # Print top consensus anomalies
     consensus = df[df["anomaly_consensus"] == 1].copy()
     if len(consensus) > 0:
-        print(f"\nConsensus anomalies (severity ≥ high):")
+        print("\nConsensus anomalies:")
         cols = ["timestamp", "avg_bytes", "unique_flows", "total_packets",
                 "iso_score", "zscore", "anomaly_count", "severity"]
         print(consensus[cols].to_string(index=False))
-    else:
-        print("No consensus anomalies flagged.")
 
-    # --- Store results to S3 ---
+    # --- S3 setup ---
     s3 = boto3.client(
         "s3",
         endpoint_url=s3_endpoint,
@@ -398,12 +431,9 @@ def detect_anomalies_and_store(
 
     run_ts = datetime.utcnow().strftime("%Y-%m-%dT%H-%M")
 
-    # Full scored results
-    full_buf = io.StringIO()
-    df.to_csv(full_buf, index=False)
+    full_buf = io.StringIO(); df.to_csv(full_buf, index=False)
     full_bytes = full_buf.getvalue().encode("utf-8")
 
-    # Anomalies only
     anomalies = df[df["anomaly_count"] > 0].copy()
     alert_cols = [
         "timestamp", "avg_bytes", "total_bytes", "total_packets", "unique_flows",
@@ -412,8 +442,7 @@ def detect_anomalies_and_store(
         "anomaly_iso", "anomaly_zscore", "anomaly_iqr",
         "anomaly_count", "anomaly_consensus", "severity",
     ]
-    anomaly_buf = io.StringIO()
-    anomalies[alert_cols].to_csv(anomaly_buf, index=False)
+    anomaly_buf = io.StringIO(); anomalies[alert_cols].to_csv(anomaly_buf, index=False)
     anomaly_bytes = anomaly_buf.getvalue().encode("utf-8")
     anomaly_json  = json.dumps(
         anomalies[alert_cols].assign(
@@ -423,19 +452,25 @@ def detect_anomalies_and_store(
     ).encode("utf-8")
 
     summary = {
-        "run_timestamp":   run_ts,
-        "generated_at":    datetime.utcnow().isoformat(),
-        "n_buckets":       n_total,
-        "n_iso":           n_iso,
-        "n_zscore":        n_zscore,
-        "n_iqr":           n_iqr,
-        "n_consensus":     n_consensus,
-        "n_critical":      int((df["severity"] == "critical").sum()),
+        "run_timestamp":    run_ts,
+        "generated_at":     datetime.utcnow().isoformat(),
+        "n_buckets":        n_total,
+        "n_iso":            n_iso,
+        "n_zscore":         n_zscore,
+        "n_iqr":            n_iqr,
+        "n_consensus":      n_consensus,
+        "n_critical":       int((df["severity"] == "critical").sum()),
         "time_range_start": str(df["timestamp"].min()),
         "time_range_end":   str(df["timestamp"].max()),
     }
     summary_bytes = json.dumps(summary, indent=2).encode("utf-8")
 
+    with open(pipeline_path, "rb") as f:
+        model_bytes = f.read()
+    with open(os.path.join(model_input.path, "feature_order.json"), "rb") as f:
+        feat_bytes = f.read()
+
+    # --- Write both timestamped and 'latest' copies ---
     for key_prefix in [f"anomalies/{run_ts}", "anomalies/latest"]:
         s3.put_object(Bucket=s3_bucket, Key=f"{key_prefix}/all_scored.csv",
                       Body=full_bytes, ContentType="text/csv")
@@ -446,27 +481,23 @@ def detect_anomalies_and_store(
         s3.put_object(Bucket=s3_bucket, Key=f"{key_prefix}/summary.json",
                       Body=summary_bytes, ContentType="application/json")
 
-    iso_buf    = io.BytesIO(); joblib.dump(iso,    iso_buf);    iso_buf.seek(0)
-    scaler_buf = io.BytesIO(); joblib.dump(scaler, scaler_buf); scaler_buf.seek(0)
-    feat_bytes = json.dumps(feat_config).encode()
-
+    # Model artifacts — KServe InferenceService reads from models/latest/
     for key_prefix in [f"models/{run_ts}", "models/latest"]:
-        s3.put_object(Bucket=s3_bucket, Key=f"{key_prefix}/iso_forest.joblib",
-                      Body=iso_buf.getvalue(), ContentType="application/octet-stream")
-        s3.put_object(Bucket=s3_bucket, Key=f"{key_prefix}/scaler.joblib",
-                      Body=scaler_buf.getvalue(), ContentType="application/octet-stream")
-        s3.put_object(Bucket=s3_bucket, Key=f"{key_prefix}/features.json",
+        s3.put_object(Bucket=s3_bucket, Key=f"{key_prefix}/model.joblib",
+                      Body=model_bytes, ContentType="application/octet-stream")
+        s3.put_object(Bucket=s3_bucket, Key=f"{key_prefix}/feature_order.json",
                       Body=feat_bytes, ContentType="application/json")
 
     print(f"Results → s3://{s3_bucket}/anomalies/{run_ts}/ and /anomalies/latest/")
     print(f"Model   → s3://{s3_bucket}/models/{run_ts}/ and /models/latest/")
+    print(f"KServe  → point InferenceService storageUri at s3://{s3_bucket}/models/latest/")
 
 
 @pipeline(
     name="packetbeat-traffic-anomaly-detection",
     description=(
-        "15-min ES aggregation (flow.final:true) → feature engineering → "
-        "Isolation Forest training → ensemble anomaly detection (IF + z-score + IQR) → S3"
+        "15-min ES aggregation (flow.final:true) -> feature engineering -> "
+        "sklearn Pipeline training (KServe-compatible) -> ensemble detection -> S3"
     ),
 )
 def anomaly_detection_pipeline(
