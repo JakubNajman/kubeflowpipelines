@@ -172,7 +172,7 @@ def preprocess_and_save_history(
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    print(f"Hourly rows: {len(df)}")
+    print(f"Hourly rows before processing: {len(df)}")
     print(f"Range: {df['timestamp'].min()} → {df['timestamp'].max()}")
 
     df["bytes_lag_1h"]   = df["total_bytes"].shift(1).fillna(df["total_bytes"])
@@ -180,8 +180,8 @@ def preprocess_and_save_history(
     df["bytes_lag_3h"]   = df["total_bytes"].shift(3).fillna(df["total_bytes"])
     df["bytes_lag_6h"]   = df["total_bytes"].shift(6).fillna(df["total_bytes"])
     df["bytes_lag_12h"]  = df["total_bytes"].shift(12).fillna(df["total_bytes"])
-    df["bytes_lag_24h"]  = df["total_bytes"].shift(24).fillna(df["total_bytes"])  # same hour yesterday
-    df["bytes_lag_168h"] = df["total_bytes"].shift(168).fillna(df["total_bytes"]) # same hour last week
+    df["bytes_lag_24h"]  = df["total_bytes"].shift(24).fillna(df["total_bytes"])
+    df["bytes_lag_168h"] = df["total_bytes"].shift(168).fillna(df["total_bytes"])
 
     df["bytes_rolling_3h"]  = df["total_bytes"].rolling(3,   min_periods=1).mean()
     df["bytes_rolling_6h"]  = df["total_bytes"].rolling(6,   min_periods=1).mean()
@@ -189,13 +189,21 @@ def preprocess_and_save_history(
     df["bytes_rolling_24h"] = df["total_bytes"].rolling(24,  min_periods=1).mean()
     df["bytes_rolling_7d"]  = df["total_bytes"].rolling(168, min_periods=1).mean()
 
-    df["hour_of_day"]   = df["timestamp"].dt.hour
-    df["day_of_week"]   = df["timestamp"].dt.dayofweek
-    df["is_weekend"]    = (df["day_of_week"] >= 5).astype(int)
-    df["hour_sin"]      = np.sin(2 * np.pi * df["hour_of_day"] / 24)
-    df["hour_cos"]      = np.cos(2 * np.pi * df["hour_of_day"] / 24)
-    df["dow_sin"]       = np.sin(2 * np.pi * df["day_of_week"] / 7)
-    df["dow_cos"]       = np.cos(2 * np.pi * df["day_of_week"] / 7)
+    # --- Time features ---
+    df["hour_of_day"] = df["timestamp"].dt.hour
+    df["day_of_week"] = df["timestamp"].dt.dayofweek
+    df["is_weekend"]  = (df["day_of_week"] >= 5).astype(int)
+    df["hour_sin"]    = np.sin(2 * np.pi * df["hour_of_day"] / 24)
+    df["hour_cos"]    = np.cos(2 * np.pi * df["hour_of_day"] / 24)
+    df["dow_sin"]     = np.sin(2 * np.pi * df["day_of_week"] / 7)
+    df["dow_cos"]     = np.cos(2 * np.pi * df["day_of_week"] / 7)
+
+    df["next_hour_bytes"] = df["total_bytes"].shift(-1)
+
+    df = df.dropna(subset=["next_hour_bytes"]).reset_index(drop=True)
+
+    print(f"Training-ready rows after shift: {len(df)}  (last row dropped — no future target)")
+    print(f"Target range: {df['next_hour_bytes'].min():,.0f} → {df['next_hour_bytes'].max():,.0f} bytes")
 
     try:
         buf = io.StringIO()
@@ -211,7 +219,6 @@ def preprocess_and_save_history(
         print(f"Warning: could not save history to S3: {e}")
 
     df.to_csv(output_data.path, index=False)
-    print(f"Training-ready rows: {len(df)}")
 
 
 @component(
@@ -247,7 +254,8 @@ def train_model(
         "bytes_rolling_12h", "bytes_rolling_24h", "bytes_rolling_7d",
         "hour_sin", "hour_cos", "dow_sin", "dow_cos", "is_weekend",
     ]
-    target_col = "total_bytes"
+
+    target_col = "next_hour_bytes"
 
     X = df[feature_cols].fillna(0)
     y = df[target_col]
@@ -256,22 +264,22 @@ def train_model(
         print(f"Using Ridge regression ({n_hours} hours — below 168h XGBoost threshold)")
         model_type = "ridge"
         if n_hours > forecast_horizon:
-            split = n_hours - forecast_horizon
-            model = Ridge(alpha=1.0)
+            split  = n_hours - forecast_horizon
+            model  = Ridge(alpha=1.0)
             model.fit(X.iloc[:split], y.iloc[:split])
             preds  = model.predict(X.iloc[split:])
             y_test = y.iloc[split:]
             mae    = mean_absolute_error(y_test, preds)
             rmse   = np.sqrt(mean_squared_error(y_test, preds))
             mape   = np.mean(np.abs((y_test.values - preds) / (y_test.values + 1))) * 100
-            model.fit(X, y)
+            model.fit(X, y)  # refit on all data
         else:
-            model = Ridge(alpha=1.0)
+            model  = Ridge(alpha=1.0)
             model.fit(X, y)
-            preds = model.predict(X)
-            mae   = mean_absolute_error(y, preds)
-            rmse  = np.sqrt(mean_squared_error(y, preds))
-            mape  = np.mean(np.abs((y.values - preds) / (y.values + 1))) * 100
+            preds  = model.predict(X)
+            mae    = mean_absolute_error(y, preds)
+            rmse   = np.sqrt(mean_squared_error(y, preds))
+            mape   = np.mean(np.abs((y.values - preds) / (y.values + 1))) * 100
     else:
         print(f"Using XGBoost ({n_hours} hours)")
         model_type = "xgboost"
@@ -293,8 +301,8 @@ def train_model(
         rmse  = np.sqrt(mean_squared_error(y_test, preds))
         mape  = np.mean(np.abs((y_test.values - preds) / (y_test.values + 1))) * 100
 
-    print(f"MAE:  {mae:,.0f} bytes")
-    print(f"RMSE: {rmse:,.0f} bytes")
+    print(f"MAE:  {mae:,.0f} bytes  ({mae/1e6:.2f} MB)")
+    print(f"RMSE: {rmse:,.0f} bytes  ({rmse/1e6:.2f} MB)")
     print(f"MAPE: {mape:.2f}%")
 
     metrics.log_metric("MAE",            float(mae))
@@ -318,7 +326,8 @@ def train_model(
     with open(os.path.join(model_output.path, "model_type.json"), "w") as f:
         json.dump({"type": model_type}, f)
 
-    print(f"Model ({model_type}) + features + model_type saved ✓")
+    print(f"Model ({model_type}) saved ✓")
+    print(f"Target: next_hour_bytes (true 1-hour ahead forecast)")
 
 
 @component(
@@ -342,13 +351,6 @@ def forecast_and_store_s3(
     from botocore.client import Config
     import io
 
-    if not s3_endpoint:
-        raise ValueError("s3_endpoint is required")
-    if not s3_access_key:
-        raise ValueError("s3_access_key is required")
-    if not s3_secret_key:
-        raise ValueError("s3_secret_key is required")
-
     df = pd.read_csv(input_data.path)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.sort_values("timestamp")
@@ -362,9 +364,10 @@ def forecast_and_store_s3(
         model_type = json.load(f)["type"]
 
     print(f"Model type: {model_type}")
+    print(f"Forecasting {forecast_horizon} hours ahead from {df['timestamp'].max()}")
 
-    last_row  = df.iloc[-1].copy()
-    history   = df["total_bytes"].tolist()
+    last_row = df.iloc[-1].copy()
+    history  = df["total_bytes"].tolist()
     forecasts = []
 
     for i in range(1, forecast_horizon + 1):
@@ -404,16 +407,19 @@ def forecast_and_store_s3(
         forecasts.append({
             "timestamp":      future_ts.isoformat(),
             "forecast_bytes": pred,
+            "forecast_mb":    round(pred / 1e6, 2),
             "forecast_mbps":  round(pred * 8 / 3600 / 1e6, 4),
             "generated_at":   datetime.utcnow().isoformat(),
             "training_hours": len(df),
+            "horizon_step":   i,
             "horizon_hours":  forecast_horizon,
             "model_type":     model_type,
         })
+
         history.append(pred)
 
     forecast_df = pd.DataFrame(forecasts)
-    print(forecast_df[["timestamp", "forecast_bytes", "forecast_mbps"]].to_string(index=False))
+    print(forecast_df[["timestamp", "forecast_bytes", "forecast_mb", "forecast_mbps"]].to_string(index=False))
 
     s3 = boto3.client(
         "s3",
@@ -462,7 +468,6 @@ def forecast_and_store_s3(
     s3.put_object(Bucket=s3_bucket, Key="models/latest/model_type.json",
                   Body=json.dumps({"type": model_type}).encode(), ContentType="application/json")
 
-
     if model_type == "xgboost":
         with tempfile.TemporaryDirectory() as tmp:
             xgb_path = os.path.join(tmp, "model.json")
@@ -472,16 +477,16 @@ def forecast_and_store_s3(
             model.save_model(xgb_path)
             with open(xgb_path, "rb") as f:
                 xgb_bytes = f.read()
-
         s3.put_object(Bucket=s3_bucket, Key=f"models/{run_ts}/model.json",
-                    Body=xgb_bytes, ContentType="application/json")
+                      Body=xgb_bytes, ContentType="application/json")
         s3.put_object(Bucket=s3_bucket, Key="models/latest/model.json",
-                    Body=xgb_bytes, ContentType="application/json")
-        print(f"XGBoost json model saved → models/{run_ts}/model.json + models/latest/model.json ✓")
+                      Body=xgb_bytes, ContentType="application/json")
+        print(f"XGBoost model.json saved ✓")
+
 
 @pipeline(
     name="packetbeat-traffic-forecasting-hourly",
-    description="Hourly ES aggregation → feature engineering → train → forecast → S3",
+    description="Hourly ES aggregation (flow.final:true) → feature engineering → train on next_hour_bytes → forecast → S3",
 )
 def traffic_forecasting_pipeline(
     es_host:          str   = "",
@@ -489,7 +494,7 @@ def traffic_forecasting_pipeline(
     es_password:      str   = "",
     es_index_prefix:  str   = "packetbeat-free5gc",
     fetch_days:       int   = 9,
-    forecast_horizon: int   = 168,   # default: forecast next 7 days in hours
+    forecast_horizon: int   = 24,
     s3_endpoint:      str   = "",
     s3_access_key:    str   = "",
     s3_secret_key:    str   = "",
@@ -518,7 +523,7 @@ def traffic_forecasting_pipeline(
         history_key=history_key,
     )
     preprocess_task.set_caching_options(False)
-    preprocess_task.set_memory_limit("1G")      # up from 512Mi
+    preprocess_task.set_memory_limit("1G")
     preprocess_task.set_memory_request("512Mi")
     preprocess_task.set_cpu_limit("1")
 
@@ -527,7 +532,7 @@ def traffic_forecasting_pipeline(
         forecast_horizon=forecast_horizon,
     )
     train_task.set_caching_options(False)
-    train_task.set_memory_limit("4G")           # up from 2G
+    train_task.set_memory_limit("4G")
     train_task.set_memory_request("2G")
     train_task.set_cpu_limit("2")
 
@@ -541,7 +546,7 @@ def traffic_forecasting_pipeline(
         forecast_horizon=forecast_horizon,
     )
     forecast_task.set_caching_options(False)
-    forecast_task.set_memory_limit("1G")        # up from 512Mi
+    forecast_task.set_memory_limit("1G")
     forecast_task.set_memory_request("512Mi")
     forecast_task.set_cpu_limit("1")
 
