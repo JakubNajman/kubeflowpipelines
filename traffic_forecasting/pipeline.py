@@ -273,7 +273,7 @@ def train_model(
         model_type = "ridge"
         if n_hours > forecast_horizon:
             split  = n_hours - forecast_horizon
-            model  = Ridge(alpha=1.0)
+            model  = Ridge(alpha=1e9)
             model.fit(X.iloc[:split], y.iloc[:split])
             preds  = model.predict(X.iloc[split:])
             y_test = y.iloc[split:]
@@ -282,7 +282,7 @@ def train_model(
             mape   = np.mean(np.abs((y_test.values - preds) / (y_test.values + 1))) * 100
             model.fit(X, y)  # refit on all data
         else:
-            model  = Ridge(alpha=1.0)
+            model  = Ridge(alpha=1e9)
             model.fit(X, y)
             preds  = model.predict(X)
             mae    = mean_absolute_error(y, preds)
